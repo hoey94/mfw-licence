@@ -5244,8 +5244,8 @@ Please check for updates first, or visit the GitHub releases page.</source>
         <message>
             <location filename="../view/setting_interface/setting_interface.py" line="1837" />
             <location filename="../view/setting_interface/setting_interface.py" line="1887" />
-            <source>MaaFW version: </source>
-            <translation>MaaFW 版本</translation>
+            <source>FrameWork version: </source>
+            <translation>框架版本：</translation>
         </message>
         <message>
             <location filename="../view/setting_interface/setting_interface.py" line="1854" />

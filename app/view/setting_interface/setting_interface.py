@@ -51,6 +51,12 @@ from app.common.theme_manager import apply_theme_from_config, bind_setting_inter
 from app.widget.notice_message import NoticeMessageBox
 from app.common.config import cfg, isWin11, Config
 from app.common import __version__ as version_meta
+from app.common.branding import (
+    BRAND_CONTACT,
+    BRAND_DESCRIPTION,
+    BRAND_NAME,
+    RELEASE_NOTES_TEXT,
+)
 from app.common.signal_bus import signalBus
 from app.core.core import ServiceCoordinator
 from app.utils.crypto import crypto_manager
@@ -319,7 +325,7 @@ class SettingInterface(QWidget):
         self._github_url = self.interface_data.get(
             "github", self.interface_data.get("url", "")
         )
-        self.description = self.interface_data.get("description", "")
+        self.description = BRAND_DESCRIPTION
         self._updater: Optional[Update] = None
         # 使用 Update 本身作为“仅检查更新”的线程对象（check_only=True）
         self._update_checker: Optional[Update] = None
@@ -501,7 +507,7 @@ class SettingInterface(QWidget):
         info_column = QVBoxLayout()
         info_column.setSpacing(6)
 
-        title_text = self.tr("ChainFlow Assistant")
+        title_text = BRAND_NAME
         self.resource_name_label = OptionLabel(title_text, header_card)
         self.resource_name_label.setStyleSheet("font-size: 24px; font-weight: 600;")
         self.resource_name_label.ensurePolished()
@@ -517,7 +523,7 @@ class SettingInterface(QWidget):
             speed_px_per_sec=28.0, interval_ms=30, pause_ms=1200
         )
         self.resource_name_label.setToolTip(title_text)
-        default_contact = self.interface_data.get("contact", "")
+        default_contact = BRAND_CONTACT
         self.contact_label = BodyLabel("", self)
         self.contact_label.setStyleSheet("color: rgba(255, 255, 255, 0.7);")
         self.contact_label.setWordWrap(True)
@@ -583,6 +589,15 @@ class SettingInterface(QWidget):
         self.update_log_button = self._create_detail_button(
             self.tr("Open update log"), FIF.QUICK_NOTE
         )
+        # 独立分发版不提供许可证 / GitHub / 更新 / 更新日志入口。
+        # 保留按钮对象以维持内部状态逻辑，仅从界面隐藏。
+        for _button in (
+            self.license_button,
+            self.github_button,
+            self.update_button,
+            self.update_log_button,
+        ):
+            _button.hide()
 
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setRange(0, 100)
@@ -640,9 +655,7 @@ class SettingInterface(QWidget):
         detail_row.addWidget(self.progress_container, 1)
         header_layout.addLayout(detail_row)
 
-        default_description = self.tr("Description: ") + self.interface_data.get(
-            "description", ""
-        )
+        default_description = BRAND_DESCRIPTION
 
         self.description_label = BodyLabel("", self)
         self.description_label.setStyleSheet("color: rgba(255, 255, 255, 0.7);")
@@ -722,19 +735,11 @@ class SettingInterface(QWidget):
         )
 
     def _open_update_log(self):
-        """打开更新日志对话框"""
-        # 获取项目名称，用于加载对应的更新日志
-        project_name = self._get_project_name()
-        release_notes = self._load_release_notes(project_name)
-
-        if not release_notes:
-            # 如果没有本地更新日志，显示提示信息
-            release_notes = {
-                self.tr("No update log"): self.tr(
-                    "No update log found locally.\n\n"
-                    "Please check for updates first, or visit the GitHub releases page."
-                )
-            }
+        """打开更新日志对话框（内容由发行版固定写死）。"""
+        # 用 HTML 包装，确保 markdown 渲染时保留固定文案的逐行换行。
+        release_notes = {
+            self.tr("Update Log"): "<div>" + RELEASE_NOTES_TEXT + "</div>"
+        }
 
         # 使用 NoticeMessageBox 显示更新日志
         dialog = NoticeMessageBox(
@@ -1611,7 +1616,18 @@ class SettingInterface(QWidget):
         self.updateGroup.addSettingCard(self.github_api_key_card)
         self.updateGroup.addSettingCard(self.proxy)
 
-        self.add_setting_group(self.updateGroup)
+        # 独立分发版不提供更新设置入口：保留卡片对象供内部逻辑使用，整组隐藏。
+        for _card in (
+            self.MirrorCard,
+            self.auto_update,
+            self.channel_selector,
+            self.force_github,
+            self.reset_resource_card,
+            self.github_api_key_card,
+            self.proxy,
+        ):
+            _card.hide()
+        self.updateGroup.hide()
 
     def initialize_compatibility_settings(self):
         """添加兼容性/实验功能设置组，默认不推荐开启。"""
@@ -1837,7 +1853,8 @@ class SettingInterface(QWidget):
         if latest_metadata:
             self.interface_data = latest_metadata
         metadata = self.interface_data or {}
-        icon_path = metadata.get("icon", "")
+        # 独立发行版关于卡片固定使用 MeiYue logo，不被资源包 icon 覆盖。
+        icon_path = DEFAULT_APP_LOGO_FILE
         name = metadata.get("name", "")
         # 保存项目名称，用于更新日志等功能
         self.name = name if name else "MFW_CFA"
@@ -1848,13 +1865,9 @@ class SettingInterface(QWidget):
         description = metadata.get("description", "")
         contact = metadata.get("contact", "")
 
-        display_title = self._service_coordinator.interface_api.resolve_display_name(
-            self.tr("ChainFlow Assistant")
-        )
+        display_title = BRAND_NAME
         self.resource_name_label.setText(display_title)
-        self.resource_name_label.setToolTip(
-            display_title or self.tr("ChainFlow Assistant")
-        )
+        self.resource_name_label.setToolTip(display_title)
         # 当前版本 / 最新版本 / UI版本 / MaaFW版本 水平展示
         from maa.library import Library
 
@@ -1869,12 +1882,12 @@ class SettingInterface(QWidget):
             + self.tr("UI version: ")
             + str(UI_VERSION)
             + "    "
-            + self.tr("MaaFW version: ")
+            + self.tr("FrameWork version: ")
             + maafw_version
         )
-        self._apply_markdown_to_label(self.description_label, description)
+        self._apply_markdown_to_label(self.description_label, BRAND_DESCRIPTION)
         self._apply_markdown_to_label(
-            self.contact_label, self._linkify_contact_urls(contact)
+            self.contact_label, self._linkify_contact_urls(BRAND_CONTACT)
         )
         self._github_url = github
         self._license_content = license_value
@@ -1886,8 +1899,8 @@ class SettingInterface(QWidget):
         使用「MFW-ChainFlow Assistant」本体的信息刷新头部展示（宿主应用视角）。
         """
         icon_path = DEFAULT_APP_LOGO_FILE
-        name = self.tr("MFW-ChainFlow Assistant")
-        self.name = "MFW_CFA"
+        name = BRAND_NAME
+        self.name = BRAND_NAME
         # 当前版本使用 UI 本体版本号
         current_version = UI_VERSION
         license_value = "GNU Affero General Public License v3.0"
@@ -1919,12 +1932,12 @@ class SettingInterface(QWidget):
             self.tr("Current version: ")
             + str(current_version)
             + "    "
-            + self.tr("MaaFW version: ")
+            + self.tr("FrameWork version: ")
             + maafw_version
         )
-        self._apply_markdown_to_label(self.description_label, description)
+        self._apply_markdown_to_label(self.description_label, BRAND_DESCRIPTION)
         self._apply_markdown_to_label(
-            self.contact_label, self._linkify_contact_urls(contact)
+            self.contact_label, self._linkify_contact_urls(BRAND_CONTACT)
         )
         self._github_url = github
         self._license_content = license_value
@@ -2679,29 +2692,8 @@ class SettingInterface(QWidget):
         logger.info("更新器初始化完成")
 
     def _init_update_checker(self):
-        """在后台检查资源更新，并在完成后回传结果"""
-        if not self._service_coordinator:
-            logger.warning("service_coordinator 未初始化，跳过更新检查器")
-            return
-        skip_checker, reason = self._should_skip_update_checker()
-        if skip_checker:
-            logger.info("跳过更新检查器启动：%s", reason)
-            return
-        # 使用 Update 本身的仅检查模式进行后台检查，不触发下载与热更新流程
-        interface = self._service_coordinator.tasks.interface
-        self._update_checker = Update(
-            service_coordinator=self._service_coordinator,
-            stop_signal=signalBus.update_stopped,
-            progress_signal=signalBus.update_progress,
-            info_bar_signal=signalBus.info_bar_requested,
-            interface=interface,
-            force_full_download=False,
-            check_only=True,
-        )
-        # 仅检查模式下，Update 不会发出 InfoBar / 进度相关信号，只通过 check_result_ready 返回结果
-        self._update_checker.check_result_ready.connect(self._on_update_check_result)
-        self._update_checker.finished.connect(self._update_checker.deleteLater)
-        self._update_checker.start()
+        """独立分发版不在启动时访问 GitHub，后台更新检查器已停用。"""
+        logger.info("独立分发版已停用启动时的 GitHub 更新检查")
 
     def _should_skip_update_checker(self) -> tuple[bool, str]:
         """根据自动更新和本地包状态决定是否跳过检查线程。"""

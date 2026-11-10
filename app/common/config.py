@@ -55,7 +55,7 @@ def _detect_auto_update_default() -> bool:
     根据版本号决定自动更新默认值：
     - 资源版本或 UI 版本含 ci/alpha 时默认关闭（仅可手动更新）
     - UI 版本另含 beta 时也默认关闭
-    - 否则默认开启
+    - 独立分发版不提供自动更新，一律默认关闭
     """
     resource_version = read_resource_version_from_cwd()
     if version_disallows_auto_update(resource_version):
@@ -65,7 +65,7 @@ def _detect_auto_update_default() -> bool:
         return False
     if "beta" in ui_version.lower():
         return False
-    return True
+    return False
 
 
 _AUTO_UPDATE_DEFAULT = _detect_auto_update_default()

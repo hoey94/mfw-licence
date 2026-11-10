@@ -106,6 +106,7 @@ from app.view.setting_interface.setting_interface import (
 from app.view.test_interface.test_interface import TestInterface
 from app.view.bundle_interface.bundle_interface import BundleInterface
 from app.common.config import cfg
+from app.common.branding import BRAND_NAME
 from app.common.constants import _CONTROLLER_
 from app.common.signal_bus import signalBus
 from app.utils.asset_paths import app_logo_icon, resolve_window_icon
@@ -2644,26 +2645,11 @@ class MainWindow(MSFluentWindow):
         QTimer.singleShot(0, self._begin_tutorial_after_announcement)
 
     def _bootstrap_auto_update_and_run(self) -> None:
-        """启动自动更新并串行等待，更新后再执行自动任务。"""
+        """独立分发版不在启动时访问 GitHub，直接进入下一步流程。"""
         self._pending_auto_run = bool(
             self._cli_auto_run or cfg.get(cfg.run_after_startup)
         )
-        from app.utils.version_policy import is_auto_update_permitted
-
-        auto_update_allowed = is_auto_update_permitted(
-            config_enabled=bool(cfg.get(cfg.auto_update)),
-            interface=self.service_coordinator.tasks.interface,
-        )
-        if auto_update_allowed:
-            logger.info("自动更新已开启，准备启动自动更新线程")
-            self._start_auto_update_thread()
-            return
-        if cfg.get(cfg.auto_update):
-            logger.info(
-                "配置已开启自动更新，但当前资源版本为 CI/Alpha，跳过自动更新"
-            )
-        # 未开启 UI 自动更新时，直接进入下一步：检查是否需要执行 bundle 自动更新
-        logger.info("自动更新未开启，改为检查并执行 bundle 自动更新")
+        logger.info("独立分发版已停用启动时的 GitHub 自动更新")
         self._check_and_start_bundle_update()
 
     def _start_auto_update_thread(self) -> None:
@@ -3105,20 +3091,13 @@ class MainWindow(MSFluentWindow):
 
     def set_title(self):
         """设置窗口标题"""
-        default_name = self.tr("ChainFlow Assistant")
-        base_title = self.service_coordinator.interface_api.resolve_display_title(
-            default_name
+        # 独立发行版窗口标题固定为「MeiYue <资源版本>」。
+        interface_version = str(
+            (self.service_coordinator.tasks.interface or {}).get("version", "")
+            or "1.0.0"
         )
-
-        if cfg.get(cfg.multi_resource_adaptation):
-            from app.common.__version__ import __version__
-
-            # 多资源模式下：显示应用名 + 应用版本 + 资源标题
-            prefix = f"{self.tr('MFW-ChainFlow Assistant')} {__version__}"
-            title = f"{prefix} {base_title}".strip()
-            self.setWindowIcon(app_logo_icon())
-        else:
-            title = base_title
+        title = f"{BRAND_NAME} {interface_version}"
+        self.setWindowIcon(app_logo_icon())
 
         # 刷新运行时标记：是否为管理员权限（供其他界面快速读取）
         try:

@@ -38,6 +38,12 @@ from qfluentwidgets import (
 from app.common.config import cfg
 from app.common.signal_bus import signalBus
 from app.common import __version__ as version_meta
+from app.common.branding import (
+    BRAND_DESCRIPTION,
+    BRAND_GROUP_PURPOSE,
+    BRAND_NAME,
+    RELEASE_NOTES_TEXT,
+)
 
 from app.core.core import ServiceCoordinator
 from app.view.task_interface.components.list_item import OptionLabel
@@ -483,7 +489,7 @@ class DashboardInterface(QWidget):
     def _build_hero_card(self) -> QWidget:
         card = LiquidGlassHeroCard(self)
         card.setObjectName("V5HeroCard")
-        card.setFixedHeight(210)
+        card.setFixedHeight(300)
         card.installEventFilter(self)
         self._hero_card = card
 
@@ -514,12 +520,18 @@ class DashboardInterface(QWidget):
         subtitle.setWordWrap(True)
         subtitle.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         text_col.addWidget(subtitle)
-        text_col.addStretch(1)
 
         version = BodyLabel(self._format_hero_version_text(), card)
         version.setObjectName("V5HeroVersion")
         version.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         text_col.addWidget(version)
+
+        group_purpose = BodyLabel(BRAND_GROUP_PURPOSE, card)
+        group_purpose.setObjectName("V5HeroVersion")
+        group_purpose.setWordWrap(True)
+        group_purpose.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        text_col.addWidget(group_purpose)
+        text_col.addStretch(1)
         box.addLayout(text_col, 7)
 
         cover_stage = QFrame(card)
@@ -566,39 +578,14 @@ class DashboardInterface(QWidget):
         header.setObjectName("V5SectionTitle")
         box.addWidget(header)
 
-        note = self._get_latest_release_note()
-        if note is None:
-            empty_label = BodyLabel(
-                self.tr(
-                    "No update log found locally.\n\n"
-                    "Please check for updates first, or visit the GitHub releases page."
-                ),
-                card,
-            )
-            empty_label.setObjectName("V5InfoValue")
-            empty_label.setWordWrap(True)
-            box.addWidget(empty_label)
-            return card
-
-        version, content = note
-
-        version_label = BodyLabel(version, card)
+        version_label = BodyLabel(UI_VERSION, card)
         version_label.setObjectName("V5InfoValue")
         box.addWidget(version_label)
 
-        content_label = BodyLabel(card)
+        content_label = BodyLabel(RELEASE_NOTES_TEXT, card)
         content_label.setObjectName("V5InfoKey")
         content_label.setWordWrap(True)
-        apply_rich_text_html(content_label, render_markdown(content))
         box.addWidget(content_label)
-
-        hint = BodyLabel(
-            self.tr("View full changelog in Settings > Open update log."),
-            card,
-        )
-        hint.setObjectName("V5InfoKey")
-        hint.setWordWrap(True)
-        box.addWidget(hint)
         return card
 
     def _build_action_grid(self):
@@ -661,24 +648,10 @@ class DashboardInterface(QWidget):
         return interface_data or {}
 
     def _get_hero_title(self) -> str:
-        return self.service_coordinator.interface_api.resolve_display_name(
-            self.tr("ChainFlow Assistant")
-        )
+        return BRAND_NAME
 
     def _get_hero_subtitle(self) -> str:
-        metadata = self._get_interface_metadata()
-        raw_description = str(metadata.get("description", "") or "").strip()
-        if not raw_description:
-            return self.tr("A More Modern Console Interface")
-
-        lines = [line.strip() for line in raw_description.splitlines() if line.strip()]
-        if not lines:
-            return self.tr("A More Modern Console Interface")
-
-        subtitle = " ".join(lines)
-        subtitle = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", subtitle)  # Markdown links
-        subtitle = re.sub(r"[*_`~]+", "", subtitle).strip()
-        return subtitle or self.tr("A More Modern Console Interface")
+        return BRAND_DESCRIPTION
 
     def _get_hero_resource_version(self) -> str:
         metadata = self._get_interface_metadata()
