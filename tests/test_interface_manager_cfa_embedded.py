@@ -1,0 +1,125 @@
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+import jsonc
+import pytest
+
+from app.core.service.interface_manager import InterfaceManager
+from hotfix_extract import (
+    CFA_SETTING_FILENAME,
+    apply_cfa_embedded_to_interface,
+    sync_interface_after_hotfix,
+)
+from tests.test_resource_hash import _FakeResource
+
+
+@pytest.fixture
+def bundle_dir(tmp_path: Path) -> Path:
+    (tmp_path / CFA_SETTING_FILENAME).write_text(
+        json.dumps({"update_flag": "1", "embedded": True}),
+        encoding="utf-8",
+    )
+    interface = {
+        "name": "TestBundle",
+        "version": "1.0.0",
+        "agent": {"child_args": ["{PROJECT_DIR}/agent/main.py"]},
+    }
+    (tmp_path / "interface.json").write_text(
+        json.dumps(interface, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_apply_cfa_embedded_to_interface_updates_agent(bundle_dir: Path):
+    interface = {"agent": {"embedded": False}}
+    assert apply_cfa_embedded_to_interface(interface, bundle_dir) is True
+    assert interface["agent"]["embedded"] is True
+
+
+def test_apply_cfa_embedded_to_interface_noop_when_missing(bundle_dir: Path):
+    interface = {"agent": {"embedded": False}}
+    (bundle_dir / CFA_SETTING_FILENAME).unlink()
+    assert apply_cfa_embedded_to_interface(interface, bundle_dir) is False
+    assert interface["agent"]["embedded"] is False
+
+
+def test_interface_manager_initialize_syncs_embedded(bundle_dir: Path):
+    manager = InterfaceManager()
+    manager._reset_state()
+    manager.initialize(interface_path=bundle_dir / "interface.json")
+
+    assert manager.get_original_interface()["agent"]["embedded"] is True
+    assert manager.get_interface()["agent"]["embedded"] is True
+
+    saved = jsonc.loads((bundle_dir / "interface.json").read_text(encoding="utf-8"))
+    assert saved["agent"]["embedded"] is True
+
+
+def test_interface_manager_finds_cfa_setting_in_parent_dir(tmp_path: Path):
+    bundle_root = tmp_path / "bundle"
+    nested = bundle_root / "assets"
+    nested.mkdir(parents=True)
+    (bundle_root / CFA_SETTING_FILENAME).write_text(
+        json.dumps({"update_flag": "1", "embedded": True}),
+        encoding="utf-8",
+    )
+    (nested / "interface.json").write_text(
+        json.dumps(
+            {
+                "name": "Nested",
+                "agent": {"child_args": ["agent/main.py"], "embedded": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manager = InterfaceManager()
+    manager._reset_state()
+    manager.initialize(interface_path=nested / "interface.json")
+
+    assert manager.get_original_interface()["agent"]["embedded"] is True
+
+
+def test_try_load_text_from_path_keeps_inline_html_description():
+    with tempfile.TemporaryDirectory() as tmp:
+        manager = InterfaceManager()
+        manager._reset_state()
+        manager._interface_dir = Path(tmp)
+        inline = (
+            "是否消耗时序通行证最好提前自己设置好<br/>"
+            '<b><font color="#ff0000">伟</font></b>' * 40
+        )
+        assert manager._try_load_text_from_path(inline) == inline
+
+
+def test_try_load_text_from_path_reads_relative_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "desc.md").write_text("from-file", encoding="utf-8")
+        manager = InterfaceManager()
+        manager._reset_state()
+        manager._interface_dir = root
+        assert manager._try_load_text_from_path("desc.md") == "from-file"
+
+
+def test_sync_interface_after_hotfix_uses_apply_helper(bundle_dir: Path):
+    resource_dir = bundle_dir / "res"
+    resource_dir.mkdir()
+    interface_path = bundle_dir / "interface.json"
+    interface = jsonc.loads(interface_path.read_text(encoding="utf-8"))
+    interface["resource"] = [{"name": "main", "path": ["res"], "hash": "old-hash"}]
+    interface_path.write_text(
+        json.dumps(interface, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    with patch("maa.resource.Resource", _FakeResource):
+        assert sync_interface_after_hotfix([interface_path], "2.0.0", bundle_dir) is True
+
+    saved = jsonc.loads(interface_path.read_text(encoding="utf-8"))
+    assert saved["version"] == "2.0.0"
+    assert saved["agent"]["embedded"] is True
+    assert saved["resource"][0]["hash"] == "computed-hash"

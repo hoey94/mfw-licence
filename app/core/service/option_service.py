@@ -1,0 +1,1164 @@
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import jsonc
+
+from app.core.service.task_service import TaskService
+from app.core.item import CoreSignalBus, TaskItem
+from app.common.constants import _CONTROLLER_, _PRETASK_, _RESOURCE_, POST_ACTION
+
+
+_CONTROLLER_BASE_FIELDS = {
+    "controller_type",
+    "gpu",
+    "agent_timeout",
+    "agent_embedded",
+    "custom",
+}
+
+_POST_ACTION_DEFAULTS: Dict[str, Any] = {
+    "none": True,
+    "shutdown": False,
+    "close_controller": False,
+    "close_software": False,
+    "run_other": False,
+    "run_program": False,
+    "always_run": False,
+    "target_config": "",
+    "program_path": "",
+    "program_args": "",
+}
+_POST_ACTION_KEYS = frozenset(_POST_ACTION_DEFAULTS)
+_POST_ACTION_EXCLUSIVE_EXIT_GROUP = ("shutdown", "close_software", "run_other")
+
+
+class OptionService:
+    """选项服务实现"""
+
+    def __init__(self, task_service: TaskService, signal_bus: CoreSignalBus):
+        self.task_service = task_service
+        self.signal_bus = signal_bus
+        self.current_task_id = None
+        self.current_options: Dict[str, Any] = {}
+        self.form_structure: Optional[Dict[str, Any]] = {}  # 保存当前表单结构
+
+    def select_task(self, task_id: str) -> bool:
+        """当任务被选中时加载选项和表单结构"""
+        self.current_task_id = task_id
+        task = self.task_service.get_task(task_id)
+        if task:
+            # 确保速通配置存在并与 interface 对齐（基础任务不需要 speedrun_config）
+            try:
+                self.task_service.ensure_speedrun_config_for_task(task, persist=True)
+            except Exception:
+                pass
+            self.current_options = task.task_option
+            from app.common.constants import _RESOURCE_, _CONTROLLER_, POST_ACTION
+
+            if task.item_id == _PRETASK_:
+                self.form_structure = self._build_pretask_form_structure()
+            elif task.item_id == _RESOURCE_: 
+                self.form_structure = {"type": "resource"}
+            elif task.item_id == _CONTROLLER_:
+                self.form_structure = {"type": "controller"}
+            elif task.item_id == POST_ACTION:
+                self.form_structure = {"type": "post_action"}
+            else:
+                # 获取表单结构
+                self.form_structure = self.get_form_structure_by_task_name(
+                    task.name, self.task_service.interface
+                )
+            self.signal_bus.options_loaded.emit()
+            return True
+        return False
+
+    def clear_selection(self) -> None:
+        """重置当前选项状态，用于配置切换等场景。"""
+        self.current_task_id = None
+        self.current_options = {}
+        self.form_structure = {}
+
+    def _on_option_updated(self, option_data: Dict[str, Any]) -> bool:
+        """当选项更新时保存到当前任务"""
+        if not self.current_task_id:
+            return False
+
+        task = self.task_service.get_task(self.current_task_id)
+        if not task:
+            return False
+
+        if task.item_id == _PRETASK_:
+            return self._on_pretask_option_updated(task, option_data)
+
+        # 更新任务中的选项并持久化
+        task.task_option.update(option_data)
+
+        # 基础任务不应该包含 speedrun_config
+        from app.common.constants import _RESOURCE_, _CONTROLLER_, POST_ACTION
+
+        if task.is_base_task() and "_speedrun_config" in task.task_option:
+            del task.task_option["_speedrun_config"]
+
+        success = self.task_service.update_task(task)
+
+        # 发出选项更新信号，通知UI层更新显示
+        if success:
+            # 若更新了资源/控制器类型，则刷新所有任务的 is_hidden（供 runner 直接使用）
+            if "resource" in option_data or "controller_type" in option_data:
+                try:
+                    self.task_service.refresh_hidden_flags()
+                except Exception:
+                    pass
+            # 资源/控制器变化时，重新计算当前任务的 form_structure（按 option.controller/resource 过滤）
+            if (
+                ("controller_type" in option_data or "resource" in option_data)
+                and task
+                and not task.is_base_task()
+            ):
+                self._refresh_current_task_form_structure()
+            self.signal_bus.option_updated.emit(option_data)
+
+        return success
+
+
+    def get_setting_form_structure(self) -> Dict[str, Any]:
+        """构建 v2.8 Setting 页面表单结构，按 section 顺序去重 option。"""
+        interface = self.task_service.interface or {}
+        all_options = interface.get("option", {}) if isinstance(interface, dict) else {}
+        sections = interface.get("setting", []) if isinstance(interface, dict) else []
+        form: Dict[str, Any] = {"type": "setting", "sections": []}
+        if not isinstance(all_options, dict) or not isinstance(sections, list):
+            return form
+
+        seen: set[str] = set()
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            option_names = section.get("option", [])
+            if not isinstance(option_names, list):
+                continue
+            section_keys: list[str] = []
+            for option_name in option_names:
+                if not isinstance(option_name, str) or not option_name or option_name in seen:
+                    continue
+                option_def = all_options.get(option_name)
+                if not isinstance(option_def, dict):
+                    continue
+                if not self.is_option_visible(option_def):
+                    continue
+                form[option_name] = self.process_option_def(option_def, all_options, option_name)
+                seen.add(option_name)
+                section_keys.append(option_name)
+            if section_keys:
+                form["sections"].append(
+                    {
+                        "name": section.get("name", ""),
+                        "label": section.get("label", section.get("name", "")),
+                        "description": section.get("description", ""),
+                        "option": section_keys,
+                        "default_expand": section.get("default_expand", True),
+                    }
+                )
+        return form
+
+    def _interface_options(self) -> Dict[str, Any]:
+        interface = self.task_service.interface or {}
+        options = interface.get("option", {})
+        return options if isinstance(options, dict) else {}
+
+    def reveal_options(self, options: Any) -> Any:
+        """解密选项树中的密码字段，供 View 展示。"""
+        from app.core.utils.option_secret import decrypt_option_tree
+
+        return decrypt_option_tree(options, self._interface_options())
+
+    def seal_options(self, options: Any) -> Any:
+        """加密选项树中的密码字段，供持久化。"""
+        from app.core.utils.option_secret import encrypt_option_tree
+
+        return encrypt_option_tree(options, self._interface_options())
+
+    def get_options(self) -> Dict[str, Any]:
+        """获取当前任务的选项（密码字段已解密）。"""
+        revealed = self.reveal_options(self.current_options)
+        return revealed if isinstance(revealed, dict) else {}
+
+    def get_option(self, option_key: str) -> Any:
+        """获取特定选项（密码字段已解密）。"""
+        return self.get_options().get(option_key)
+
+    def update_option(self, option_key: str, option_value: Any) -> bool:
+        """更新选项"""
+        sealed = self.seal_options({option_key: option_value})
+        if not isinstance(sealed, dict):
+            sealed = {option_key: option_value}
+        self.current_options[option_key] = sealed.get(option_key, option_value)
+        return self._on_option_updated(sealed)
+
+    def update_options(self, options: Dict[str, Any]) -> bool:
+        """批量更新选项"""
+        sealed = self.seal_options(options)
+        if not isinstance(sealed, dict):
+            sealed = options
+        self.current_options.update(sealed)
+        return self._on_option_updated(sealed)
+
+    @staticmethod
+    def _normalize_json_value(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {
+                str(key): OptionService._normalize_json_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [OptionService._normalize_json_value(item) for item in value]
+        return value
+
+    def _controller_names(self) -> set[str]:
+        interface = self.task_service.interface or {}
+        controllers = interface.get("controller", [])
+        if not isinstance(controllers, list):
+            return set()
+        return {
+            str(controller.get("name"))
+            for controller in controllers
+            if isinstance(controller, dict) and controller.get("name")
+        }
+
+    def _sanitize_controller_options(
+        self,
+        existing: Dict[str, Any],
+        changes: Dict[str, Any],
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        allowed_fields = _CONTROLLER_BASE_FIELDS | self._controller_names()
+        sanitized = {
+            key: self._normalize_json_value(value)
+            for key, value in existing.items()
+            if key in allowed_fields
+        }
+        accepted_changes = {
+            key: self._normalize_json_value(value)
+            for key, value in changes.items()
+            if key in allowed_fields
+        }
+        sanitized.update(accepted_changes)
+        sanitized.pop("_speedrun_config", None)
+        return sanitized, accepted_changes
+
+    def update_controller_options(self, options: Dict[str, Any]) -> bool:
+        """过滤并保存 Controller 任务选项，一次写入对应一次域事件。"""
+        task = self.task_service.get_task(_CONTROLLER_)
+        if not task or not isinstance(options, dict):
+            return False
+
+        existing = task.task_option if isinstance(task.task_option, dict) else {}
+        sanitized, accepted_changes = self._sanitize_controller_options(
+            existing,
+            options,
+        )
+        if sanitized == existing:
+            return True
+
+        task.task_option = sanitized
+        if not self.task_service.update_task(task):
+            return False
+
+        if self.current_task_id == _CONTROLLER_:
+            self.current_options = task.task_option
+        if "controller_type" in accepted_changes:
+            self.task_service.refresh_hidden_flags()
+            self._refresh_current_task_form_structure()
+        self.signal_bus.option_updated.emit(accepted_changes)
+        return True
+
+    def update_controller_field(
+        self,
+        controller_name: str,
+        controller_type: str,
+        field_name: str,
+        value: Any,
+    ) -> bool:
+        """将控制器表单字段转换为存储字段并保存。"""
+        if not controller_name or not field_name:
+            return False
+        task = self.task_service.get_task(_CONTROLLER_)
+        if not task:
+            return False
+
+        options = task.task_option if isinstance(task.task_option, dict) else {}
+        stored = options.get(controller_name, {})
+        controller_options = dict(stored) if isinstance(stored, dict) else {}
+
+        normalized_value = self._normalize_json_value(value)
+        if field_name == "config" and isinstance(normalized_value, str):
+            try:
+                normalized_value = jsonc.loads(normalized_value)
+            except (jsonc.JSONDecodeError, ValueError):
+                pass
+
+        aliases = {
+            "gamepad_hwnd": "hwnd",
+            "gamepad_program_path": "program_path",
+            "gamepad_program_params": "program_params",
+            "playcover_address": "address",
+            "wlroots_socket_path": "wlr_socket_path",
+            "macos_window_id": "window_id",
+            "macos_program_path": "program_path",
+            "macos_program_params": "program_params",
+        }
+        wait_fields = {
+            "adb_wait_time",
+            "win32_wait_time",
+            "gamepad_wait_time",
+            "macos_wait_time",
+        }
+        target_field = aliases.get(field_name, field_name)
+        if field_name in wait_fields:
+            target_field = "wait_time"
+            try:
+                normalized_value = max(0, int(str(normalized_value).strip() or "0"))
+            except (TypeError, ValueError):
+                normalized_value = 0
+
+        controller_options[target_field] = normalized_value
+        if controller_type.lower() == "playcover":
+            controller_options.pop("playcover_uuid", None)
+        return self.update_controller_options(
+            {controller_name: controller_options}
+        )
+
+    def update_controller_device(
+        self,
+        controller_name: str,
+        device_name: str,
+        device_info: Dict[str, Any],
+    ) -> bool:
+        """合并设备搜索结果并保存当前控制器配置。"""
+        if not controller_name or not isinstance(device_info, dict):
+            return False
+        task = self.task_service.get_task(_CONTROLLER_)
+        if not task:
+            return False
+        options = task.task_option if isinstance(task.task_option, dict) else {}
+        stored = options.get(controller_name, {})
+        controller_options = dict(stored) if isinstance(stored, dict) else {}
+        controller_options.update(self._normalize_json_value(device_info))
+        controller_options["device_name"] = str(device_name or "")
+        return self.update_controller_options(
+            {controller_name: controller_options}
+        )
+
+    def update_controller_selection(
+        self,
+        controller_name: str,
+        controller_info: Dict[str, Any],
+    ) -> bool:
+        """保存控制器类型及其接口元信息与类型默认字段。"""
+        if not controller_name or not isinstance(controller_info, dict):
+            return False
+        task = self.task_service.get_task(_CONTROLLER_)
+        if not task:
+            return False
+        options = task.task_option if isinstance(task.task_option, dict) else {}
+        stored = options.get(controller_name, {})
+        controller_options = dict(stored) if isinstance(stored, dict) else {}
+
+        for key in (
+            "permission_required",
+            "display_short_side",
+            "display_long_side",
+            "display_raw",
+        ):
+            if controller_info.get(key) is not None:
+                controller_options[key] = deepcopy(controller_info[key])
+
+        controller_type = str(controller_info.get("type", "") or "").lower()
+        if controller_type == "playcover":
+            playcover = controller_info.get("playcover", {})
+            default_uuid = (
+                playcover.get("uuid", "maa.playcover")
+                if isinstance(playcover, dict)
+                else "maa.playcover"
+            )
+            controller_options.setdefault("uuid", default_uuid)
+            controller_options.setdefault("address", "")
+            controller_options.pop("playcover_uuid", None)
+
+        controller_options_payload, accepted_changes = (
+            self._sanitize_controller_options(
+                options,
+                {
+                    "controller_type": controller_name,
+                    controller_name: controller_options,
+                },
+            )
+        )
+        controller_changed = controller_options_payload != options
+        task.task_option = controller_options_payload
+
+        resource_task = self.task_service.get_task(_RESOURCE_)
+        resource_changed = False
+        selected_resource = ""
+        if resource_task:
+            resource_source = (
+                resource_task.task_option
+                if isinstance(resource_task.task_option, dict)
+                else {}
+            )
+            selected_resource = str(resource_source.get("resource", "") or "")
+            compatible_resources: list[str] = []
+            interface = self.task_service.interface or {}
+            for resource in interface.get("resource", []):
+                if not isinstance(resource, dict) or not resource.get("name"):
+                    continue
+                allowed = resource.get("controller")
+                if allowed in (None, "", [], {}):
+                    compatible_resources.append(str(resource["name"]))
+                elif isinstance(allowed, str) and allowed == controller_name:
+                    compatible_resources.append(str(resource["name"]))
+                elif isinstance(allowed, list) and controller_name in allowed:
+                    compatible_resources.append(str(resource["name"]))
+            if compatible_resources and selected_resource not in compatible_resources:
+                selected_resource = compatible_resources[0]
+                resource_task.task_option = self._normalize_resource_task_options(
+                    resource_source,
+                    selected_resource,
+                )
+                resource_changed = resource_task.task_option != resource_source
+
+        if not controller_changed and not resource_changed:
+            return True
+        if resource_changed and resource_task:
+            success = self.task_service.update_tasks([task, resource_task])
+        else:
+            success = self.task_service.update_task(task)
+        if not success:
+            return False
+
+        if self.current_task_id == _CONTROLLER_:
+            self.current_options = task.task_option
+        self.task_service.refresh_hidden_flags()
+        self._refresh_current_task_form_structure()
+        event_payload = dict(accepted_changes)
+        if resource_changed:
+            event_payload["resource"] = selected_resource
+        self.signal_bus.option_updated.emit(event_payload)
+        return True
+
+    @staticmethod
+    def normalize_post_action(action: Dict[str, Any] | None) -> Dict[str, Any]:
+        """规范化完成后动作字段及互斥关系。"""
+        normalized = dict(_POST_ACTION_DEFAULTS)
+        if isinstance(action, dict):
+            normalized.update(
+                {
+                    key: deepcopy(value)
+                    for key, value in action.items()
+                    if key in _POST_ACTION_KEYS
+                }
+            )
+
+        selected_exit = next(
+            (
+                key
+                for key in _POST_ACTION_EXCLUSIVE_EXIT_GROUP
+                if bool(normalized.get(key))
+            ),
+            None,
+        )
+        for key in _POST_ACTION_EXCLUSIVE_EXIT_GROUP:
+            normalized[key] = key == selected_exit
+
+        action_keys = {
+            "shutdown",
+            "close_controller",
+            "close_software",
+            "run_other",
+            "run_program",
+        }
+        if normalized.get("none"):
+            for key in action_keys:
+                normalized[key] = False
+        elif not any(bool(normalized.get(key)) for key in action_keys):
+            normalized["none"] = True
+        else:
+            normalized["none"] = False
+
+        if not normalized.get("run_other"):
+            normalized["target_config"] = ""
+        return normalized
+
+    def update_post_action(self, action: Dict[str, Any]) -> bool:
+        """规范化并保存 Post-Action，一次写入对应一次域事件。"""
+        task = self.task_service.get_task(POST_ACTION)
+        if not task:
+            return False
+
+        normalized = self.normalize_post_action(action)
+        new_options = {"post_action": normalized}
+        existing = task.task_option if isinstance(task.task_option, dict) else {}
+        if existing == new_options:
+            return True
+
+        task.task_option = new_options
+        if not self.task_service.update_task(task):
+            return False
+        if self.current_task_id == POST_ACTION:
+            self.current_options = task.task_option
+        self.signal_bus.option_updated.emit({"post_action": normalized})
+        return True
+
+    def get_current_speedrun_config(self) -> Dict[str, Any]:
+        """返回当前普通任务的标准化条件执行配置。"""
+        if not self.current_task_id:
+            return {}
+        task = self.task_service.get_task(self.current_task_id)
+        if not task or task.is_base_task() or task.is_builtin_task():
+            return {}
+        existing = (
+            task.task_option.get("_speedrun_config")
+            if isinstance(task.task_option, dict)
+            else None
+        )
+        return self.task_service.build_speedrun_config(task.name, existing)
+
+    def update_speedrun_config(self, config: Dict[str, Any]) -> bool:
+        """标准化并保存当前任务的条件执行配置。"""
+        if not self.current_task_id:
+            return False
+        task = self.task_service.get_task(self.current_task_id)
+        if not task or task.is_base_task() or task.is_builtin_task():
+            return False
+        normalized = self.task_service.build_speedrun_config(task.name, config)
+        return self.update_option("_speedrun_config", normalized)
+
+    def update_setting_options(self, options: Dict[str, Any]) -> bool:
+        """保存 Setting 表单值，存储位置由 ConfigService 统一管理。"""
+        sealed = self.seal_options(options)
+        if not isinstance(sealed, dict):
+            sealed = options
+        return self.task_service.config_service.update_current_setting_options(sealed)
+
+    def _resource_option_names(self, resource_name: str) -> tuple[set[str], set[str]]:
+        all_names: set[str] = set()
+        active_names: set[str] = set()
+        interface = self.task_service.interface or {}
+        resources = interface.get("resource", [])
+        if not isinstance(resources, list):
+            return all_names, active_names
+        for resource in resources:
+            if not isinstance(resource, dict):
+                continue
+            names = resource.get("option", [])
+            if not isinstance(names, list):
+                continue
+            valid_names = {name for name in names if isinstance(name, str)}
+            all_names.update(valid_names)
+            if resource.get("name") == resource_name:
+                active_names = valid_names
+        return all_names, active_names
+
+    def _normalize_resource_task_options(
+        self,
+        source: Dict[str, Any],
+        resource_name: str,
+        submitted_options: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        all_names, active_names = self._resource_option_names(resource_name)
+        stored = source.get("resource_options", {})
+        stored_options = dict(stored) if isinstance(stored, dict) else {}
+
+        for name in all_names:
+            if name in source and name not in stored_options:
+                stored_options[name] = deepcopy(source[name])
+        if isinstance(submitted_options, dict):
+            stored_options.update(
+                {
+                    key: deepcopy(value)
+                    for key, value in submitted_options.items()
+                    if key in active_names
+                }
+            )
+
+        for name in all_names:
+            if name not in stored_options:
+                continue
+            value = stored_options[name]
+            if name not in active_names:
+                stored_options[name] = (
+                    {**value, "hidden": True}
+                    if isinstance(value, dict)
+                    else {"value": value, "hidden": True}
+                )
+            elif isinstance(value, dict) and "hidden" in value:
+                visible_value = {
+                    key: item for key, item in value.items() if key != "hidden"
+                }
+                stored_options[name] = (
+                    visible_value["value"]
+                    if set(visible_value) == {"value"}
+                    else visible_value
+                )
+
+        normalized: Dict[str, Any] = {"resource": resource_name}
+        setting_options = source.get("setting_options")
+        if isinstance(setting_options, dict):
+            normalized["setting_options"] = deepcopy(setting_options)
+        if stored_options:
+            normalized["resource_options"] = stored_options
+        return normalized
+
+    def update_resource_selection(self, resource_name: str) -> bool:
+        """更新 Resource 基础任务，并在持久化成功后通知资源上下文变化。"""
+        resource_task = self.task_service.get_task(_RESOURCE_)
+        if not resource_task:
+            return False
+        existing = (
+            resource_task.task_option
+            if isinstance(resource_task.task_option, dict)
+            else {}
+        )
+        resource_task.task_option = self._normalize_resource_task_options(
+            existing,
+            resource_name,
+        )
+        if resource_task.task_option == existing:
+            return True
+
+        if not self.task_service.update_task(resource_task):
+            return False
+
+        if self.current_task_id == _RESOURCE_:
+            self.current_options = resource_task.task_option
+        self.task_service.refresh_hidden_flags()
+        self._refresh_current_task_form_structure()
+        self.signal_bus.option_updated.emit({"resource": resource_name})
+        return True
+
+    def update_resource_options(
+        self,
+        resource_options: Dict[str, Any],
+        active_option_names: List[str],
+    ) -> bool:
+        """保存当前资源的子选项，并维护其他资源选项的 hidden 状态。"""
+        resource_task = self.task_service.get_task(_RESOURCE_)
+        if not resource_task:
+            return False
+        existing = (
+            resource_task.task_option
+            if isinstance(resource_task.task_option, dict)
+            else {}
+        )
+        resource_name = str(existing.get("resource", "") or "")
+        sealed_resource_options = self.seal_options(resource_options)
+        if not isinstance(sealed_resource_options, dict):
+            sealed_resource_options = resource_options
+        resource_task.task_option = self._normalize_resource_task_options(
+            existing,
+            resource_name,
+            {
+                key: value
+                for key, value in sealed_resource_options.items()
+                if key in set(active_option_names)
+            },
+        )
+
+        if not self.task_service.update_task(resource_task):
+            return False
+
+        if self.current_task_id == _RESOURCE_:
+            self.current_options = resource_task.task_option
+        self.signal_bus.option_updated.emit(dict(resource_options))
+        return True
+
+    def get_form_structure(self) -> Optional[Dict[str, Any]]:
+        """获取当前表单结构"""
+        return self.form_structure
+
+    def get_form_field(self, field_name: str) -> Optional[Dict[str, Any]]:
+        """获取特定表单字段的配置"""
+        if isinstance(self.form_structure, dict):
+            field_value = self.form_structure.get(field_name)
+            # 确保返回的是字典类型，如果不是则返回None
+            return field_value if isinstance(field_value, dict) else None
+        return None
+
+    def _copy_icon_from_source(
+        self, target: Dict[str, Any], source: Dict[str, Any]
+    ) -> None:
+        """将 source 中的 icon 字段复制到 target"""
+        icon = source.get("icon")
+        if icon:
+            target["icon"] = icon
+
+    def _copy_description_from_source(
+        self, target: Dict[str, Any], source: Dict[str, Any]
+    ) -> None:
+        """将 source 中的 description 字段复制到 target"""
+        description = source.get("description")
+        if description:
+            target["description"] = description
+
+    def _build_child_fields(
+        self,
+        option_value: Any,
+        all_options: Dict[str, Dict[str, Any]],
+    ) -> list[Dict[str, Any]]:
+        option_names = (
+            [option_value]
+            if isinstance(option_value, str)
+            else option_value
+            if isinstance(option_value, list)
+            else []
+        )
+        child_fields: list[Dict[str, Any]] = []
+        for option_name in option_names:
+            if not isinstance(option_name, str) or option_name not in all_options:
+                continue
+            child_field = self.process_option_def(
+                all_options[option_name], all_options, option_name
+            )
+            child_field.setdefault("name", option_name)
+            child_fields.append(child_field)
+        return child_fields
+
+    def process_option_def(
+        self,
+        option_def: Dict[str, Any],
+        all_options: Dict[str, Dict[str, Any]],
+        option_key: str = "",
+    ) -> Dict[str, Any]:
+        """
+        递归处理选项定义，处理select类型中cases的子选项(option参数)
+
+        Args:
+            option_def: 选项定义字典
+            all_options: 所有选项定义的字典
+            option_key: 选项的键名，当没有name和label时使用
+
+        Returns:
+            Dict: 处理后的字段配置，可能包含children属性存储子选项
+        """
+        field_config = {}
+        option_type = option_def.get("type")
+        if isinstance(option_type, str):
+            option_type = option_type.lower()
+
+        # 向后兼容：缺失 type 的选项默认视为 combobox
+        if not option_type:
+            option_type = "combobox"
+
+        # 保存选项的 name（用于从接口文件中获取具体选项）
+        if option_key:
+            field_config["name"] = option_key
+
+        # 设置字段标签，处理$前缀
+        # 优先使用label，其次是name，如果都没有则使用option_key
+        label = option_def.get("label", option_def.get("name", option_key))
+        field_config["label"] = label
+
+        # 处理description字段
+        description = option_def.get("description")
+        if description:
+            field_config["description"] = description
+
+        # 复制 icon 信息（如果有）
+        self._copy_icon_from_source(field_config, option_def)
+
+        # 处理不同类型的选项
+
+        # 处理 switch 类型
+        if option_type == "switch":
+            field_config["type"] = "switch"
+            # switch 类型固定为 YES 和 NO 两个选项
+            options = [{"name": "Yes", "label": "是"}, {"name": "No", "label": "否"}]
+            children = {}
+
+            # 处理 cases 中的子选项，但只关注 YES 和 NO
+            for case in option_def.get("cases", []):
+                case_name = case.get("name", "")
+                # 标准化处理：不区分大小写，处理各种可能的 YES/NO 变体
+                case_name_upper = (
+                    case_name.upper()
+                    if isinstance(case_name, str)
+                    else str(case_name).upper()
+                )
+
+                # 确定对应的标准名称（Yes 或 No）
+                if case_name_upper in ["YES", "Y", "TRUE", "1", "ON"]:
+                    standard_name = "Yes"
+                elif case_name_upper in ["NO", "N", "FALSE", "0", "OFF"]:
+                    standard_name = "No"
+                else:
+                    # 如果不匹配，跳过
+                    continue
+
+                # 递归处理 cases 中的子选项(option参数)
+                child_fields = self._build_child_fields(
+                    case.get("option"), all_options
+                )
+
+                if child_fields:
+                    if len(child_fields) == 1:
+                        children[standard_name] = child_fields[0]
+                    else:
+                        children[standard_name] = child_fields
+
+            field_config["options"] = options
+            # 如果有子选项，添加children属性
+            if children:
+                field_config["children"] = children
+
+        elif option_type == "hotkey":
+            field_config["type"] = "hotkey"
+            hotkeys_source = option_def.get("hotkeys", [])
+            field_config["hotkeys"] = [
+                dict(item) for item in hotkeys_source if isinstance(item, dict)
+            ]
+
+        elif option_type == "input":
+            inputs_source = option_def.get("inputs", [])
+            inputs = [dict(item) for item in inputs_source]
+            has_main_label = bool(option_def.get("label"))
+
+            # 区分 input 和 inputs 类型：
+            # - 有主 label → type = "inputs"（选项组，显示主标签+子输入框列表）
+            # - 没有主 label → type = "input"（每个都是独立的单输入框）
+            if has_main_label:
+                # 有主 label，作为 inputs 选项组
+                field_config["type"] = "inputs"
+                field_config["inputs"] = inputs
+                field_config["single_input"] = False
+            else:
+                # 没有主 label，每个都作为独立的 input
+                field_config["type"] = "input"
+                field_config["inputs"] = inputs
+                field_config["single_input"] = len(inputs) == 1
+                if len(inputs) > 1:
+                    field_config["independent_inputs"] = True  # 标记为独立输入模式
+
+            # 传递verify字段到表单结构中
+            if "verify" in option_def:
+                field_config["verify"] = option_def["verify"]
+            # 如果有默认值，使用第一个input的默认值
+            if inputs and "default" in inputs[0]:
+                field_config["default"] = inputs[0]["default"]
+            # 处理 option 级别的 pattern_msg
+            option_pattern_msg = option_def.get("pattern_msg")
+            if option_pattern_msg:
+                field_config["pattern_msg"] = option_pattern_msg
+
+            # 为每个input项传递verify字段
+            for input_item in field_config["inputs"]:
+                # 如果input项没有自己的verify字段，使用父级的verify字段
+                if "verify" not in input_item and "verify" in option_def:
+                    input_item["verify"] = option_def["verify"]
+                # 如果input项没有自己的 pattern_msg，则继承父级 pattern_msg
+                if "pattern_msg" not in input_item and option_pattern_msg:
+                    input_item["pattern_msg"] = option_pattern_msg
+        else:
+            # 默认类型为combobox；checkbox 类型也走同样的逻辑
+            field_config["type"] = option_type if option_type == "checkbox" else "combobox"
+            options = []
+            children = {}
+
+            # 处理cases中的每个选项
+            for case in option_def.get("cases", []):
+                # 优先使用label，如果没有则使用name
+                display_label = case.get("label", case.get("name", ""))
+                option_name = case.get("name", display_label)
+
+                option_entry = {"name": option_name, "label": display_label}
+                self._copy_icon_from_source(option_entry, case)
+                self._copy_description_from_source(option_entry, case)
+                options.append(option_entry)
+
+                # 递归处理cases中的子选项(option参数)
+                child_fields = self._build_child_fields(
+                    case.get("option"), all_options
+                )
+
+                if child_fields:
+                    if len(child_fields) == 1:
+                        children[option_name] = child_fields[0]
+                    else:
+                        children[option_name] = child_fields
+
+            field_config["options"] = options
+            # 如果有子选项，添加children属性
+            if children:
+                field_config["children"] = children
+            # 传递 default_case（checkbox 使用列表，select 使用字符串）
+            if "default_case" in option_def:
+                field_config["default_case"] = option_def["default_case"]
+            if option_type == "checkbox":
+                if "min_count" in option_def:
+                    field_config["min_count"] = option_def["min_count"]
+                if "max_count" in option_def:
+                    field_config["max_count"] = option_def["max_count"]
+
+        return field_config
+
+    @staticmethod
+    def _is_allowed_by_name_list(value: Any, current: str) -> bool:
+        """resource/controller 字段的通用判断：缺省/空 => 允许；否则 current 必须命中（不区分大小写）。"""
+        if value in (None, "", [], {}):
+            return True
+        current_norm = (current or "").strip().lower()
+        if not current_norm:
+            return True
+        allowed: list[str] = []
+        if isinstance(value, str):
+            if value.strip():
+                allowed = [value.strip()]
+        elif isinstance(value, list):
+            allowed = [
+                str(x).strip()
+                for x in value
+                if x is not None and str(x).strip()
+            ]
+        else:
+            return True
+        allowed_norm = {s.lower() for s in allowed if s}
+        return current_norm in allowed_norm
+
+    def get_current_controller_name(self) -> str:
+        """当前选中的控制器 name（interface.controller[].name）。"""
+        from app.common.constants import _CONTROLLER_
+
+        controller_task = self.task_service.get_task(_CONTROLLER_)
+        if controller_task and isinstance(controller_task.task_option, dict):
+            return str(
+                controller_task.task_option.get("controller_type", "") or ""
+            ).strip()
+        return ""
+
+    def get_current_resource_name(self) -> str:
+        """当前选中的资源 name（interface.resource[].name）。"""
+        from app.common.constants import _RESOURCE_
+
+        resource_task = self.task_service.get_task(_RESOURCE_)
+        if resource_task and isinstance(resource_task.task_option, dict):
+            return str(resource_task.task_option.get("resource", "") or "").strip()
+        return ""
+
+    def _is_option_visible_for_controller(
+        self, option_def: Dict[str, Any], current_controller: str
+    ) -> bool:
+        """
+        根据 interface.option[*].controller 判断当前控制器下是否应显示该选项。
+
+        规则（与任务列表 controller 过滤一致）：
+        - 缺省/空：对所有控制器显示
+        - 字符串：仅当当前 controller 与该字符串匹配时显示
+        - 列表：仅当当前 controller 在列表中时显示（不区分大小写）
+        """
+        return self._is_allowed_by_name_list(
+            option_def.get("controller"), current_controller
+        )
+
+    def _is_option_visible_for_resource(
+        self, option_def: Dict[str, Any], current_resource: str
+    ) -> bool:
+        """
+        根据 interface.option[*].resource 判断当前资源下是否应显示该选项。
+
+        规则与 controller 一致：缺省/空=全部显示；字符串或列表为白名单（不区分大小写）。
+        """
+        return self._is_allowed_by_name_list(
+            option_def.get("resource"), current_resource
+        )
+
+    def is_option_visible(
+        self,
+        option_def: Dict[str, Any],
+        *,
+        current_controller: str | None = None,
+        current_resource: str | None = None,
+    ) -> bool:
+        """同时按 controller 与 resource 白名单判断选项是否应显示。"""
+        if current_controller is None:
+            current_controller = self.get_current_controller_name()
+        if current_resource is None:
+            current_resource = self.get_current_resource_name()
+        return self._is_option_visible_for_controller(
+            option_def, current_controller
+        ) and self._is_option_visible_for_resource(option_def, current_resource)
+
+    def _refresh_current_task_form_structure(self) -> None:
+        """资源/控制器变化后，为当前选中的普通任务重算表单结构并通知 UI。"""
+        if not self.current_task_id:
+            return
+        task = self.task_service.get_task(self.current_task_id)
+        if not task or task.is_base_task():
+            return
+        interface = getattr(self.task_service, "interface", None)
+        if not interface:
+            return
+        self.form_structure = (
+            self.get_form_structure_by_task_name(task.name, interface) or {}
+        )
+        self.signal_bus.options_loaded.emit()
+
+    def get_form_structure_by_task_name(
+        self, task_name: str, interface: dict
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        """
+        根据任务名称从interface获取对应的表单结构
+
+        Args:
+            task_name: 任务名称
+
+        Returns:
+            Dict: 表单结构字典，用于DynamicFormMixin的update_form方法
+                  如果未找到对应任务或选项，返回None
+        """
+        if (
+            not hasattr(self.task_service, "interface")
+            or not self.task_service.interface
+        ):
+            return None
+
+        form_structure = {}
+
+        # 遍历interface中的任务
+        for task in interface.get("task", []):
+            if task.get("name") == task_name:
+                # 获取任务的option字段（字符串数组）
+                task_option_names = task.get("option", [])
+                # 检查任务是否有description字段
+                task_description = task.get("description")
+                if task_description:
+                    form_structure["description"] = task_description
+                # 获取顶层的option定义
+                all_options = interface.get("option", {})
+
+                current_controller = self.get_current_controller_name()
+                current_resource = self.get_current_resource_name()
+
+                # 遍历任务需要的每个选项
+                for option_name in task_option_names:
+                    if option_name not in all_options:
+                        continue
+                    option_def = all_options[option_name]
+                    if not self.is_option_visible(
+                        option_def,
+                        current_controller=current_controller,
+                        current_resource=current_resource,
+                    ):
+                        continue
+                    # 使用process_option_def方法递归处理选项定义，传入option_name作为键名
+                    field_config = self.process_option_def(
+                        option_def, all_options, option_name
+                    )
+                    form_structure[option_name] = field_config
+                break
+
+        return form_structure if form_structure else None
+
+    def _build_pretask_form_structure(self) -> Dict[str, Any]:
+        """构建 PreTask 的表单结构，读取 interface.pretask 列表并仅渲染 Select 类型选项。
+        
+        按 pretask 条目自身的 controller/resource 字段过滤，不匹配当前选中的控制器/资源时隐藏。
+        """
+        interface = self.task_service.interface or {}
+        pretask_entries: List[Dict[str, Any]] = list(interface.get("pretask", []) or [])
+        all_options = interface.get("option", {}) or {}
+
+        current_controller = self.get_current_controller_name()
+        current_resource = self.get_current_resource_name()
+
+        form: Dict[str, Any] = {"type": "pretask", "entries": []}
+
+        for idx, entry in enumerate(pretask_entries):
+            if not isinstance(entry, dict):
+                continue
+
+            if not self._is_allowed_by_name_list(
+                entry.get("controller"), current_controller
+            ):
+                continue
+            if not self._is_allowed_by_name_list(
+                entry.get("resource"), current_resource
+            ):
+                continue
+            entry_data: Dict[str, Any] = {
+                "index": idx,
+                "label": entry.get("label", entry.get("name", "")),
+                "description": entry.get("description", ""),
+                "exec": entry.get("exec", ""),
+                "options": [],
+            }
+            option_names = entry.get("option", [])
+            if isinstance(option_names, list):
+                for option_name in option_names:
+                    if not isinstance(option_name, str):
+                        continue
+                    option_def = all_options.get(option_name)
+                    if not isinstance(option_def, dict):
+                        continue
+                    option_type = (option_def.get("type") or "select").lower()
+                    if option_type not in (
+                        "select",
+                        "switch",
+                        "combobox",
+                        "input",
+                        "checkbox",
+                        "hotkey",
+                        "",
+                    ):
+                        continue
+                    widget_key = f"entry_{idx}_{option_name}"
+                    field_config = self.process_option_def(option_def, all_options, widget_key)
+                    entry_data["options"].append({
+                        "key": widget_key,
+                        "name": option_name,
+                        "field": field_config,
+                    })
+            form["entries"].append(entry_data)
+
+        return form
+
+    def _on_pretask_option_updated(self, task: "TaskItem", option_data: Dict[str, Any]) -> bool:
+        """PreTask 选项更新：将 entry_{idx}_{option_name} 格式的 key 解析并存入嵌套结构。"""
+        import re
+
+        pretask_entries: list = list(task.task_option.get("pretask_entries", []) or [])
+
+        for widget_key, value in option_data.items():
+            match = re.match(r"^entry_(\d+)_(.+)$", widget_key)
+            if not match:
+                continue
+            entry_idx = int(match.group(1))
+            option_name = match.group(2)
+
+            while len(pretask_entries) <= entry_idx:
+                pretask_entries.append({"options": {}})
+            entry = pretask_entries[entry_idx]
+            if not isinstance(entry, dict):
+                pretask_entries[entry_idx] = {"options": {}}
+                entry = pretask_entries[entry_idx]
+            entry_options = entry.setdefault("options", {})
+            sealed_value = self.seal_options({option_name: value}).get(option_name, value)
+            if isinstance(sealed_value, dict) and entry_options.get(option_name) != sealed_value:
+                entry_options[option_name] = sealed_value
+
+        task.task_option["pretask_entries"] = pretask_entries
+
+        # 清理 update_options() 中 .update(option_data) 带来的平铺 key
+        for key in list(task.task_option.keys()):
+            if re.match(r"^entry_\d+_", key):
+                del task.task_option[key]
+
+        if task.is_base_task() and "_speedrun_config" in task.task_option:
+            del task.task_option["_speedrun_config"]
+
+        success = self.task_service.update_task(task)
+
+        if success:
+            self.signal_bus.option_updated.emit(option_data)
+
+        return success

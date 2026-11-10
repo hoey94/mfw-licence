@@ -1,0 +1,261 @@
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, List
+from PySide6.QtCore import QObject, Signal
+from app.common.constants import _PRETASK_, POST_ACTION, _CONTROLLER_, _SETTING_, _RESOURCE_
+
+
+# ==================== 信号总线 ====================
+class CoreSignalBus(QObject):
+    """核心信号总线，用于组件间通信。"""
+
+    # 配置相关信号 (多数使用 object 以传递 dataclass 对象)
+    config_changed = Signal(str)  # 配置ID
+
+    # 任务相关信号
+    tasks_loaded = Signal(object)  # List[TaskItem]
+    task_updated = Signal(object)  # TaskItem
+
+    # 选项相关信号
+    options_loaded = Signal()  # 选项加载完成信号，不携带数据
+    option_updated = Signal(object)  # 选项更新(dict)
+
+
+class ViewSignalBus(QObject):
+    """由 ServiceCoordinator 暴露给 View 的单向域事件总线。"""
+
+    task_modified = Signal(object)  # TaskItem
+    task_removed = Signal(str)  # task_id
+    config_added = Signal(object)  # ConfigItem
+    config_removed = Signal(str)  # config_id
+    config_changed = Signal(str)
+    runtime_state_changed = Signal(str, str)  # config_id, runtime state
+    options_loaded = Signal()
+    option_updated = Signal(object)
+    schedules_changed = Signal(list)
+
+
+class RunnerEvents(QObject):
+    """Runner 运行时事件，仅供 Core 内部向协调器上报。"""
+
+    callback = Signal(dict)
+    telemetry = Signal(dict)
+    log_output = Signal(str, str)
+    set_window_title = Signal(str)
+    task_status_changed = Signal(str, str)
+    task_flow_finished = Signal(dict)
+    # {"text": "START"|"STOP", "status": "enabled"|"disabled", "device_ready"?: bool}
+    start_button_status = Signal(dict)
+    log_clear_requested = Signal()
+    info_bar_requested = Signal(str, str)
+    focus_toast = Signal(str)
+    focus_notification = Signal(str)
+    focus_dialog = Signal(str)
+    focus_modal = Signal(str)
+    monitor_recognition_roi = Signal(dict)
+    # 控制器配置不完整时请求主界面遮罩引导；载荷包含当前控制器和资源支持控制器列表
+    controller_setup_hint_requested = Signal(dict)
+    # 首次运行资源包前请求用户确认；载荷含 name/contact/github
+    resource_run_confirmation_requested = Signal(dict)
+
+
+# ==================== 数据模型 ====================
+@dataclass
+class TaskItem:
+    """任务数据模型"""
+
+    name: str
+    item_id: str
+    is_checked: bool
+    task_option: Dict[str, Any]
+    task_source: str = "resource"
+    builtin_key: str = ""
+    is_hidden: bool = False  # 标记任务是否被隐藏（不保存到配置，仅运行时使用）
+
+    def is_base_task(self) -> bool:
+        """判断是否为基础任务（预任务/控制器/资源/完成后操作）"""
+        return self.item_id in (_PRETASK_, _CONTROLLER_, _RESOURCE_, POST_ACTION)
+
+    def is_builtin_task(self) -> bool:
+        """判断是否为框架加载的内置任务。"""
+        return self.task_source == "builtin" and bool(self.builtin_key)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典"""
+        payload = {
+            "name": self.name,
+            "item_id": self.item_id,
+            "is_checked": self.is_checked,
+            "task_option": self.task_option,
+        }
+        if self.task_source != "resource":
+            payload["task_source"] = self.task_source
+        if self.builtin_key:
+            payload["builtin_key"] = self.builtin_key
+        return payload
+
+    @staticmethod
+    def generate_id() -> str:
+        """生成任务 ID（t_ 前缀）。"""
+        return f"t_{uuid.uuid4().hex}"
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TaskItem":
+        """从字典创建实例，自动生成 item_id"""
+        item_id = data.get("item_id", "")
+        if not item_id:
+            item_id = cls.generate_id()
+        
+        task_option = data.get("task_option", {})
+        
+        # 如果是基础任务，清理不应该存在的字段
+        temp_task = cls(
+            name=data.get("name", ""),
+            item_id=item_id,
+            is_checked=data.get("is_checked", False),
+            task_option=task_option,
+        )
+        
+        if temp_task.is_base_task() and item_id != _PRETASK_:
+            # 基础任务不应该包含 speedrun_config
+            if isinstance(task_option, dict) and "_speedrun_config" in task_option:
+                task_option = dict(task_option)  # 创建副本避免修改原始数据
+                del task_option["_speedrun_config"]
+            
+            # Setting 任务不应该包含资源/控制器专用字段
+            if item_id == _SETTING_:
+                if isinstance(task_option, dict):
+                    task_option = dict(task_option)
+                    task_option.pop("resource", None)
+                    task_option.pop("resource_options", None)
+                    task_option.pop("controller_type", None)
+
+            # Resource 任务不应该包含控制器相关字段
+            if item_id == _RESOURCE_:
+                fields_to_remove = [
+                    "gpu",
+                    "agent_timeout",
+                    "agent_embedded",
+                    "custom",
+                    "controller_type",
+                    "adb",
+                    "win32",
+                ]
+                if isinstance(task_option, dict):
+                    task_option = dict(task_option)  # 确保是副本
+                    for field in fields_to_remove:
+                        task_option.pop(field, None)
+            
+            # Controller 任务不应该包含 resource 字段
+            if item_id == _CONTROLLER_:
+                if isinstance(task_option, dict):
+                    task_option = dict(task_option)  # 确保是副本
+                    task_option.pop("resource", None)
+        
+        return cls(
+            name=data.get("name", ""),
+            item_id=item_id,
+            is_checked=data.get("is_checked", False),
+            task_option=task_option,
+            task_source=data.get("task_source", "resource") or "resource",
+            builtin_key=data.get("builtin_key", "") or "",
+        )
+
+
+@dataclass
+class ConfigItem:
+    """配置数据模型"""
+
+    def __init__(
+        self,
+        name: str,
+        item_id: str,
+        tasks: List[TaskItem],
+        know_task: List[str],
+        bundle: str,
+        global_options: Dict[str, Any] | None = None,
+        interface_task_list_materialized: bool = False,
+    ):
+        self.name = name
+        self.item_id = item_id
+
+        self.tasks = tasks
+        self.know_task = know_task
+        # 仅保存 bundle 名称，由 Config_Service 通过主配置解析具体信息
+        self.bundle = bundle
+        self.global_options = global_options or {}
+        # True：任务列表已与 interface 对齐并冻结，不再因 interface 新增任务而自动插入配置
+        self.interface_task_list_materialized = interface_task_list_materialized
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "item_id": self.item_id,
+            "tasks": [task.to_dict() for task in self.tasks],
+            "know_task": self.know_task,
+            "global_options": self.global_options,
+            # 子配置中只保存 bundle 名称（字符串），不重复保存 bundle 详情
+            "bundle": self.bundle,
+            "interface_task_list_materialized": self.interface_task_list_materialized,
+        }
+
+    @staticmethod
+    def generate_id() -> str:
+        return f"c_{uuid.uuid4().hex}"
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ConfigItem":
+        item_id = data.get("item_id", "") or cls.generate_id()
+        raw_global_options = data.get("global_options", {})
+        if not isinstance(raw_global_options, dict):
+            raw_global_options = {}
+
+        if not raw_global_options:
+            for task_data in data.get("tasks", []):
+                if not isinstance(task_data, dict):
+                    continue
+                item_id_or_name = task_data.get("item_id") or task_data.get("name")
+                if item_id_or_name != _RESOURCE_:
+                    continue
+                task_option = task_data.get("task_option", {})
+                if not isinstance(task_option, dict):
+                    continue
+                legacy_global_options = task_option.get("global_options")
+                if isinstance(legacy_global_options, dict):
+                    raw_global_options = dict(legacy_global_options)
+                    break
+
+        # 兼容旧数据：
+        # - 新格式： "bundle": "MPA"
+        # - 旧格式1： "bundle": { "MPA": { "name": "MPA", "path": "./..." } }
+        # - 旧格式2： "bundle": { "path": "./..." }
+        raw_bundle = data.get("bundle", "")
+        bundle_name: str
+        if isinstance(raw_bundle, str):
+            bundle_name = raw_bundle or "Default Bundle"
+        elif isinstance(raw_bundle, dict):
+            if raw_bundle:
+                first_key = next(iter(raw_bundle.keys()))
+                first_val = raw_bundle[first_key]
+                # 旧格式1：{"MPA": {...}}
+                if isinstance(first_val, dict) and "path" in first_val:
+                    bundle_name = first_key
+                else:
+                    # 旧格式2：{"path": "./"} 或 {"name": "...", "path": "..."}
+                    bundle_name = str(raw_bundle.get("name") or "Default Bundle")
+            else:
+                bundle_name = "Default Bundle"
+        else:
+            bundle_name = "Default Bundle"
+
+        return cls(
+            name=data.get("name", ""),
+            item_id=item_id,
+            tasks=[TaskItem.from_dict(task) for task in data.get("tasks", [])],
+            know_task=data.get("know_task", []),
+            bundle=bundle_name,
+            global_options=raw_global_options,
+            interface_task_list_materialized=bool(
+                data.get("interface_task_list_materialized", False)
+            ),
+        )

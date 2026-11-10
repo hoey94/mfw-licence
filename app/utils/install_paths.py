@@ -1,0 +1,211 @@
+"""安装锚点、发行根与可执行文件路径解析。"""
+
+from __future__ import annotations
+
+import hashlib
+import sys
+from pathlib import Path
+
+APP_BUNDLE_NAME = "MFW.app"
+APP_EXECUTABLE_RELATIVE_PATH = Path("Contents") / "MacOS" / "MFW"
+UPDATER_DIR_NAME = "MFWUpdater"
+UPDATER_COPY_DIR_NAME = "MFWUpdater1"
+UPDATER_EXECUTABLE_NAME = (
+    "MFWUpdater.exe" if sys.platform.startswith("win32") else "MFWUpdater"
+)
+
+
+def is_packed() -> bool:
+    """是否为 Nuitka 等打包运行时（``__compiled__`` 或 ``sys.frozen``）。"""
+    return (
+        getattr(sys, "frozen", False)
+        or globals().get("__compiled__") is not None
+    )
+
+
+def resolve_install_anchor() -> Path:
+    """定位 MFW 安装锚点（主程序 Mach-O/exe 或源码 ``main.py``）。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+
+    compiled = globals().get("__compiled__")
+    if compiled is not None:
+        argv0 = getattr(compiled, "onefile_argv0", None) or sys.argv[0]
+        return Path(argv0).resolve()
+
+    if sys.argv and sys.argv[0]:
+        candidate = Path(sys.argv[0]).resolve()
+        if candidate.exists():
+            return candidate
+
+    root = Path(__file__).resolve().parents[2]
+    return (root / "main.py").resolve()
+
+
+def normalize_install_anchor(anchor: Path | str) -> Path:
+    """把 ``.app`` 路径和主程序路径统一为 bundle 内的 Mach-O 路径。"""
+    resolved = Path(anchor).resolve()
+    if resolved.suffix.lower() == ".app":
+        return (resolved / APP_EXECUTABLE_RELATIVE_PATH).resolve()
+    return resolved
+
+
+def is_app_bundle_layout(anchor: Path | str | None = None) -> bool:
+    """主程序是否位于标准 ``*.app/Contents/MacOS`` 目录中。"""
+    resolved = normalize_install_anchor(anchor or resolve_install_anchor())
+    executable_dir = resolved.parent
+    contents_dir = executable_dir.parent
+    app_dir = contents_dir.parent
+    return (
+        executable_dir.name == "MacOS"
+        and contents_dir.name == "Contents"
+        and app_dir.suffix.lower() == ".app"
+    )
+
+
+def resolve_install_root(anchor: Path | str | None = None) -> Path:
+    """定位外置发行根，即 ``MFW.app``、资源和用户数据的共同父目录。"""
+    resolved_anchor = normalize_install_anchor(anchor or resolve_install_anchor())
+    if is_app_bundle_layout(resolved_anchor):
+        return resolved_anchor.parents[3]
+
+    if resolved_anchor.parent.name in {UPDATER_DIR_NAME, UPDATER_COPY_DIR_NAME}:
+        return resolved_anchor.parent.parent
+
+    return resolved_anchor.parent
+
+
+def resolve_app_i18n_dir(anchor: Path | str | None = None) -> Path:
+    """开发态未生成 ``app_rc`` 时，从 ``app/i18n`` 加载 .qm 的回退路径。"""
+    del anchor
+    repo_root = Path(__file__).resolve().parents[2]
+    return (repo_root / "app" / "i18n").resolve()
+
+
+def resolve_main_executable(
+    install_root: Path | str | None = None,
+    *,
+    anchor: Path | str | None = None,
+) -> Path:
+    """解析可用于锁、计划任务与重启的主程序入口。"""
+    resolved_anchor = normalize_install_anchor(anchor or resolve_install_anchor())
+    if is_app_bundle_layout(resolved_anchor):
+        return resolved_anchor
+
+    root = Path(install_root or resolve_install_root(resolved_anchor)).resolve()
+    app_executable = root / APP_BUNDLE_NAME / APP_EXECUTABLE_RELATIVE_PATH
+    if app_executable.is_file():
+        return app_executable.resolve()
+
+    if is_packed() or resolved_anchor.suffix.lower() in {".exe", ".bin"}:
+        return resolved_anchor
+    return resolved_anchor
+
+
+def resolve_updater_dir(install_root: Path | str | None = None) -> Path:
+    """返回发行根中的 standalone 更新器目录。"""
+    root = Path(install_root or resolve_install_root()).resolve()
+    return root / UPDATER_DIR_NAME
+
+
+def resolve_updater_copy_dir(install_root: Path | str | None = None) -> Path:
+    """返回更新器运行副本目录（启动更新前由正式目录重命名而来）。"""
+    root = Path(install_root or resolve_install_root()).resolve()
+    return root / UPDATER_COPY_DIR_NAME
+
+
+def resolve_updater_executable(updater_dir: Path | str) -> Path:
+    """返回 standalone 更新器目录内的可执行文件路径。"""
+    return Path(updater_dir).resolve() / UPDATER_EXECUTABLE_NAME
+
+
+def resolve_updater_paths(
+    install_root: Path | str | None = None,
+) -> tuple[Path, Path]:
+    """返回正式更新器与运行副本的可执行文件路径。"""
+    updater_dir = resolve_updater_dir(install_root)
+    updater_copy_dir = resolve_updater_copy_dir(install_root)
+    return (
+        resolve_updater_executable(updater_dir),
+        resolve_updater_executable(updater_copy_dir),
+    )
+
+
+def rename_updater_binary(old_name: str | Path, new_name: str | Path) -> bool:
+    """将正式更新器目录重命名为运行副本目录。
+
+    正式目录不存在时跳过并返回 False，避免增量包未带回 ``MFWUpdater/`` 时
+    误删已有 ``MFWUpdater1/``。成功重命名返回 True。
+    """
+    import os
+    import shutil
+
+    old_path = Path(old_name)
+    new_path = Path(new_name)
+    if not old_path.exists():
+        return False
+    if new_path.exists():
+        if new_path.is_dir():
+            shutil.rmtree(new_path)
+        else:
+            os.remove(new_path)
+    os.rename(old_path, new_path)
+    return True
+
+
+def prepare_updater_runtime_copy(
+    install_root: Path | str | None = None,
+) -> tuple[bool, Path]:
+    """准备更新器运行副本：正式目录存在则重命名，否则保留已有副本。
+
+    Returns:
+        (是否执行了重命名, 运行副本目录路径)
+    """
+    root = Path(install_root or resolve_install_root()).resolve()
+    updater_dir = resolve_updater_dir(root)
+    updater_copy_dir = resolve_updater_copy_dir(root)
+    renamed = rename_updater_binary(updater_dir, updater_copy_dir)
+    return renamed, updater_copy_dir
+
+
+def resolve_schedule_instance_id() -> str:
+    """为当前安装实例生成稳定的短标识，用于隔离系统计划任务命名空间。"""
+    anchor = str(normalize_install_anchor(resolve_install_anchor()))
+    return hashlib.sha256(anchor.encode("utf-8")).hexdigest()[:8]
+
+
+def resolve_schedule_task_folder() -> str:
+    """Windows 任务计划程序文件夹名（按安装路径隔离，避免多实例互相覆盖）。"""
+    return f"MFW-ChainFlow Assistant-{resolve_schedule_instance_id()}"
+
+
+def resolve_schedule_launch_command(
+    config_id: str, *, force_start: bool, reuse_existing: bool = False
+) -> tuple[str, str]:
+    """构建计划任务启动命令，返回 (executable, arguments)。"""
+    from mfw_cli import (
+        FLAG_CONFIG_ID,
+        FLAG_DIRECT_RUN,
+        FLAG_FORCE_RESTART,
+        FLAG_REUSE_EXISTING,
+    )
+
+    cli_args: list[str] = [f"{FLAG_CONFIG_ID}={config_id}", FLAG_DIRECT_RUN]
+    if force_start:
+        cli_args.append(FLAG_FORCE_RESTART)
+    if reuse_existing:
+        cli_args.append(FLAG_REUSE_EXISTING)
+
+    anchor = resolve_main_executable()
+    if (
+        is_app_bundle_layout(anchor)
+        or is_packed()
+        or anchor.suffix.lower() in {".exe", ".bin"}
+    ):
+        return str(anchor), " ".join(cli_args)
+
+    main_py = anchor if anchor.suffix.lower() == ".py" else anchor.parent / "main.py"
+    if not main_py.is_file():
+        root = Path(__file__).resolve().parents[2]
+        main_py = root / "main.py"
+    return str(Path(sys.executable).resolve()), f'"{main_py}" {" ".join(cli_args)}'

@@ -1,0 +1,478 @@
+#   This file is part of MFW-ChainFlow Assistant.
+
+#   MFW-ChainFlow Assistant is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU Affero General Public License as published
+#   by the Free Software Foundation, either version 3 of the License,
+#   or (at your option) any later version.
+
+#   MFW-ChainFlow Assistant is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty
+#   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+#   the GNU Affero General Public License for more details.
+
+#   You should have received a copy of the GNU Affero General Public License
+#   along with MFW-ChainFlow Assistant. If not, see <https://www.gnu.org/licenses/agpl-3.0.html>.
+
+#   Contact: err.overflow@gmail.com
+#   Copyright (C) 2024-2025  MFW-ChainFlow Assistant. All rights reserved.
+
+"""
+MFW-ChainFlow Assistant
+MFW-ChainFlow Assistant 配置
+作者:overflow65537
+"""
+
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+from enum import Enum
+
+from PySide6.QtCore import QLocale
+from qfluentwidgets import (
+    qconfig,
+    QConfig,
+    ConfigItem,
+    OptionsConfigItem,
+    BoolValidator,
+    OptionsValidator,
+    RangeConfigItem,
+    RangeValidator,
+    Theme,
+    ConfigSerializer,
+)
+
+from app.common.__version__ import __version__
+from app.utils.version_policy import (
+    read_resource_version_from_cwd,
+    version_disallows_auto_update,
+)
+
+
+def _detect_auto_update_default() -> bool:
+    """
+    根据版本号决定自动更新默认值：
+    - 资源版本或 UI 版本含 ci/alpha 时默认关闭（仅可手动更新）
+    - UI 版本另含 beta 时也默认关闭
+    - 否则默认开启
+    """
+    resource_version = read_resource_version_from_cwd()
+    if version_disallows_auto_update(resource_version):
+        return False
+    ui_version = __version__ or ""
+    if version_disallows_auto_update(ui_version):
+        return False
+    if "beta" in ui_version.lower():
+        return False
+    return True
+
+
+_AUTO_UPDATE_DEFAULT = _detect_auto_update_default()
+
+
+class Language(Enum):
+    """Language enumeration mapped to QLocale."""
+
+    CHINESE_SIMPLIFIED = QLocale(QLocale.Language.Chinese, QLocale.Country.China)
+    # 繁体中文：港台澳统一为此项（界面仅「繁體中文」一项）
+    CHINESE_TRADITIONAL = QLocale(QLocale.Language.Chinese, QLocale.Country.HongKong)
+    JAPANESE = QLocale(QLocale.Language.Japanese, QLocale.Country.Japan)
+    ENGLISH = QLocale(QLocale.Language.English)
+
+
+def isWin11():
+    return sys.platform == "win32" and sys.getwindowsversion().build >= 22000
+
+
+def _detect_default_background_image() -> str:
+    """查找默认背景图，依次尝试 ./background.jpg 与 ./background.png。"""
+    for name in ("background.jpg", "background.png"):
+        candidate = Path(name)
+        if candidate.is_file():
+            return str(candidate)
+    return ""
+
+
+def _detect_default_home_cover_image() -> str:
+    """查找默认首页封面图，依次尝试 ./dashboard.jpg 与 ./dashboard.png。"""
+    for name in ("dashboard.jpg", "dashboard.png"):
+        candidate = Path(name)
+        if candidate.is_file():
+            return str(candidate)
+    return ""
+
+
+class Config(QConfig):
+    """Application configuration container."""
+
+    class LanguageSerializer(ConfigSerializer):
+        """序列化 Language 枚举，方便写入/读取 settting."""
+
+        def serialize(self, value):
+            return value.name
+
+        def deserialize(self, value: str) -> Language:
+            if isinstance(value, str):
+                if value == "CHINESE_TRADITIONAL_TW":
+                    return Language.CHINESE_TRADITIONAL
+                try:
+                    return Language[value]
+                except KeyError:
+                    for lang in Language:
+                        # 兼容旧版用 QLocale.name() 保存的值
+                        if lang.value.name() == value or lang.name == value:
+                            return lang
+            return Language.CHINESE_SIMPLIFIED
+
+    class UpdateChannel(Enum):
+        """Update channel options."""
+
+        ALPHA = 0
+        BETA = 1
+        STABLE = 2
+
+    _update_channel_validator = OptionsValidator([item.value for item in UpdateChannel])
+
+    # ===== 通用设置 =====
+    proxy = ConfigItem("General", "proxy", 0)
+    http_proxy = ConfigItem("General", "http_proxy", "")
+    socks5_proxy = ConfigItem("General", "socks5_proxy", "")
+
+    Mcdk = ConfigItem("General", "cdk", "")
+
+    run_after_startup = ConfigItem(
+        "General", "run_after_startup", False, BoolValidator()
+    )
+    auto_minimize_on_startup = ConfigItem(
+        "General", "auto_minimize_on_startup", False, BoolValidator()
+    )
+    minimize_to_tray_on_minimize_windows = ConfigItem(
+        "General", "minimize_to_tray_on_minimize_windows", False, BoolValidator()
+    )
+    run_after_startup_arg = ConfigItem(
+        "General", "run_after_startup_arg", False, BoolValidator()
+    )
+    multi_resource_adaptation = ConfigItem(
+        "Compatibility", "multi_resource_adaptation", False, BoolValidator()
+    )
+    multi_instance_enabled = ConfigItem(
+        "Compatibility", "multi_instance_enabled", False, BoolValidator()
+    )
+    save_screenshot = ConfigItem(
+        "Compatibility", "save_screenshot", False, BoolValidator()
+    )
+    special_task_tutorial_shown = ConfigItem(
+        "General", "special_task_tutorial_shown", False, BoolValidator()
+    )
+
+    announcement = ConfigItem("General", "announcement", "")
+
+    # 已确认过的资源包指纹（JSON 数组）。名称/GitHub/联系方式变化后需重新确认。
+    acknowledged_resource_runs = ConfigItem(
+        "Security", "acknowledged_resource_runs", "[]"
+    )
+
+    # ===== 隐私设置 =====
+    telemetry_enabled = ConfigItem(
+        "Privacy", "telemetry_enabled", True, BoolValidator()
+    )
+
+    # ===== 运行时标记 =====
+    # 用于在 UI/逻辑层快速判断当前进程是否处于管理员权限（会在启动时刷新）
+    is_admin = ConfigItem("Runtime", "is_admin", False, BoolValidator())
+
+    auto_update = ConfigItem(
+        "Update", "auto_update", _AUTO_UPDATE_DEFAULT, BoolValidator()
+    )
+    bundle_auto_update = ConfigItem(
+        "Bundle", "bundle_auto_update", False, BoolValidator()
+    )
+    force_github = ConfigItem("Update", "force_github", False, BoolValidator())
+    github_api_key = ConfigItem("Update", "github_api_key", "")
+
+    resource_update_channel = OptionsConfigItem(
+        "Update",
+        "resource_update_channel",
+        UpdateChannel.STABLE.value,
+        _update_channel_validator,
+    )
+
+    # ===== 任务设置 =====
+    monitor_capture_fps = RangeConfigItem(
+        "Task", "monitor_capture_fps", 30, RangeValidator(1, 120)
+    )  # 监控截图帧率（独立控制器连接，类型跟随主配置）
+    monitor_recognition_roi_enabled = ConfigItem(
+        "Task", "monitor_recognition_roi_enabled", True, BoolValidator()
+    )  # 监控预览叠加识别命中框（占用较多资源）
+    enable_gpu_acceleration = ConfigItem(
+        "Task", "enable_gpu_acceleration", True, BoolValidator()
+    )  # GPU 硬件加速开关（关闭时强制 CPU 推理）
+    task_interface_panel_layout = ConfigItem("Task", "task_interface_panel_layout", "")
+
+    # ===== 日志设置 =====
+    log_zip_include_images = ConfigItem(
+        "Log", "log_zip_include_images", False, BoolValidator()
+    )  # 是否在日志压缩包中包含图片（默认关闭）
+    log_max_images = RangeConfigItem(
+        "Log", "log_max_images", 25, RangeValidator(1, 10000)
+    )  # 日志中保存的最大图片数量（默认25张，按200KB/张计算），同时控制界面显示和压缩包保存的数量
+
+    # ===== 通知 =====
+    Notice_DingTalk_status = ConfigItem("Notice", "DingTalk_status", False)
+    Notice_DingTalk_url = ConfigItem("Notice", "DingTalk_url", "")
+    Notice_DingTalk_secret = ConfigItem("Notice", "DingTalk_secret", "")
+
+    Notice_Lark_status = ConfigItem("Notice", "Lark_status", False)
+    Notice_Lark_url = ConfigItem("Notice", "Lark_url", "")
+    Notice_Lark_secret = ConfigItem("Notice", "Lark_secret", "")
+
+    Notice_Qmsg_status = ConfigItem("Notice", "Qmsg_status", False)
+    Notice_Qmsg_sever = ConfigItem("Notice", "Qmsg_sever", "")
+    Notice_Qmsg_key = ConfigItem("Notice", "Qmsg_key", "")
+    Notice_Qmsg_user_qq = ConfigItem("Notice", "Qmsg_uesr_qq", "")
+    Notice_Qmsg_robot_qq = ConfigItem("Notice", "Qmsg_robot_qq", "")
+
+    Notice_SMTP_status = ConfigItem("Notice", "SMTP_status", False)
+    Notice_SMTP_sever_address = ConfigItem("Notice", "SMTP_sever_address", "")
+    Notice_SMTP_sever_port = ConfigItem("Notice", "SMTP_sever_port", "25")
+    Notice_SMTP_used_ssl = ConfigItem("Notice", "SMTP_used_ssl", False)
+    Notice_SMTP_user_name = ConfigItem("Notice", "SMTP_uesr_name", "")
+    Notice_SMTP_password = ConfigItem("Notice", "SMTP_password", "")
+    Notice_SMTP_send_mail = ConfigItem("Notice", "SMTP_send_mail", "")
+    Notice_SMTP_receive_mail = ConfigItem("Notice", "SMTP_receive_mail", "")
+
+    Notice_WxPusher_status = ConfigItem("Notice", "WxPush_status", False)
+    Notice_WxPusher_SPT_token = ConfigItem("Notice", "WxPusher_SPT_token", "")
+
+    Notice_QYWX_status = ConfigItem("Notice", "QYWX_status", False)
+    Notice_QYWX_key = ConfigItem("Notice", "QYWX_key", "")
+
+    Notice_Gotify_status = ConfigItem("Notice", "Gotify_status", False)
+    Notice_Gotify_url = ConfigItem("Notice", "Gotify_url", "")
+    Notice_Gotify_token = ConfigItem("Notice", "Gotify_token", "")
+    Notice_Gotify_priority = ConfigItem("Notice", "Gotify_priority", "0")
+
+    # 通用 Webhook：发送文本/富文本及可选 base64 图片，可选 Bearer Token
+    Notice_Webhook_status = ConfigItem("Notice", "Webhook_status", False)
+    Notice_Webhook_url = ConfigItem("Notice", "Webhook_url", "")
+    Notice_Webhook_token = ConfigItem("Notice", "Webhook_token", "")
+
+    # OneBot v11 HTTP API（NapCat / LLOneBot / go-cqhttp）
+    Notice_OneBot_status = ConfigItem("Notice", "OneBot_status", False)
+    Notice_OneBot_url = ConfigItem("Notice", "OneBot_url", "")
+    Notice_OneBot_token = ConfigItem("Notice", "OneBot_token", "")
+    Notice_OneBot_target_type = ConfigItem("Notice", "OneBot_target_type", "private")
+    Notice_OneBot_target_id = ConfigItem("Notice", "OneBot_target_id", "")
+
+    when_start_up = ConfigItem("Notice", "when_start_up", False)
+    # 通知时机配置，分别控制不同场景下的通知发送
+    when_flow_started = ConfigItem("Notice", "when_flow_started", False)  # 任务流启动时
+    when_connect_success = ConfigItem(
+        "Notice", "when_connect_success", False
+    )  # 连接成功时
+    when_connect_failed = ConfigItem(
+        "Notice", "when_connect_failed", True
+    )  # 连接失败时
+    when_task_success = ConfigItem("Notice", "when_task_success", False)  # 任务成功时
+    when_task_failed = ConfigItem("Notice", "when_task_failed", True)  # 任务失败时
+    when_post_task = ConfigItem("Notice", "when_post_task", True)  # 任务流完成时
+    when_task_timeout = ConfigItem("Notice", "when_task_timeout", True)  # 任务超时
+    when_task_finished = ConfigItem("Notice", "when_task_finished", False)  # 保留兼容性
+    # 是否随通知发送截图（任务流发送通知时若控制器可用则附带当前截图）
+    notice_send_screenshot = ConfigItem(
+        "Notice", "notice_send_screenshot", False, BoolValidator()
+    )
+
+    # ===== 主窗口 =====
+    micaEnabled = ConfigItem("MainWindow", "MicaEnabled", isWin11(), BoolValidator())
+
+    dpiScale = OptionsConfigItem(
+        "MainWindow",
+        "DpiScale",
+        "Auto",
+        OptionsValidator([1, 1.25, 1.5, 1.75, 2, "Auto"]),
+        restart=True,
+    )
+
+    language = OptionsConfigItem(
+        "MainWindow",
+        "Language",
+        Language.CHINESE_SIMPLIFIED,  # 默认值（后续会被自动检测覆盖）
+        OptionsValidator(Language),
+        LanguageSerializer(),
+        restart=True,
+    )
+
+    language_auto_detected = ConfigItem(
+        "MainWindow", "LanguageAutoDetected", False, BoolValidator()
+    )
+
+    remember_window_geometry = ConfigItem(
+        "MainWindow", "remember_window_geometry", False, BoolValidator()
+    )
+    last_window_geometry = ConfigItem("MainWindow", "LastWindowGeometry", "")
+
+    # 启动后默认展示的页面：last 表示恢复上次退出时所在页面
+    startup_page = OptionsConfigItem(
+        "MainWindow",
+        "startup_page",
+        "home",
+        OptionsValidator(["last", "home", "task", "monitor", "schedule", "setting"]),
+    )
+    last_active_page = ConfigItem("MainWindow", "last_active_page", "home")
+
+    start_task_shortcut = ConfigItem("Shortcuts", "start_task_shortcut", "Ctrl+F1")
+    stop_task_shortcut = ConfigItem("Shortcuts", "stop_task_shortcut", "Alt+F1")
+
+    show_advanced_startup_options = ConfigItem(
+        "Personalization",
+        "show_advanced_startup_options",
+        False,
+        BoolValidator(),
+    )
+
+    # ===== 背景 =====
+    _default_background = _detect_default_background_image()
+    _default_home_cover = _detect_default_home_cover_image()
+    background_image_path = ConfigItem(
+        "Personalization", "background_image_path", _default_background
+    )
+    home_cover_image_path = ConfigItem(
+        "Personalization", "home_cover_image_path", _default_home_cover
+    )
+    background_image_opacity = RangeConfigItem(
+        "Personalization", "background_image_opacity", 10, RangeValidator(0, 100)
+    )
+
+    # ===== 材质 & 通用界面 =====
+    blurRadius = RangeConfigItem(
+        "Material", "AcrylicBlurRadius", 15, RangeValidator(0, 40)
+    )
+
+    # ===== 软件更新 =====
+    latest_update_version = ConfigItem("Update", "LatestUpdateVersion", "")
+    cdk_expired_time = ConfigItem("Update", "CdkExpiredTime", -1)
+
+    # dev
+    enable_test_interface_page = ConfigItem(
+        "Dev", "enable_test_interface_page", False, BoolValidator()
+    )
+
+
+cfg = Config()
+cfg.themeMode.value = Theme.AUTO
+qconfig.load("config/config.json", cfg)
+
+
+def _parse_defaults_apple_languages(output: str) -> list[str]:
+    """解析 ``defaults read -g AppleLanguages`` 的数组输出。"""
+    return [match.group(1) for match in re.finditer(r'"([^"]+)"', output)]
+
+
+def _macos_apple_languages() -> list[str]:
+    """macOS：读取全局 AppleLanguages（等同 ``defaults read -g AppleLanguages``）。"""
+    if sys.platform != "darwin":
+        return []
+    try:
+        result = subprocess.run(
+            ["defaults", "read", "-g", "AppleLanguages"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    return _parse_defaults_apple_languages(result.stdout)
+
+
+def _language_from_ui_tag(tag: str) -> Language | None:
+    """从 BCP47/UI 语言标签解析 Language（如 ``zh-Hans-CN``、``zh_TW``、``ja``）。"""
+    normalized = tag.strip().replace("_", "-").lower()
+    if not normalized:
+        return None
+    primary = normalized.split("-", 1)[0]
+
+    if primary in {"zh", "cmn"}:
+        # 繁体常见标记：Hant / TW / HK / MO
+        if any(
+            token in normalized
+            for token in ("hant", "-tw", "-hk", "-mo", "taiwan", "hongkong", "macao")
+        ):
+            return Language.CHINESE_TRADITIONAL
+        return Language.CHINESE_SIMPLIFIED
+
+    if primary == "ja":
+        return Language.JAPANESE
+
+    if primary == "en":
+        return Language.ENGLISH
+
+    return None
+
+
+def detect_system_language() -> Language:
+    """检测系统语言并返回对应的 Language 枚举。
+
+    macOS 使用 ``defaults read -g AppleLanguages``；其它平台在 ``QApplication``
+    创建之后使用 ``QLocale.system().uiLanguages()``。
+    """
+    from app.utils.logger import logger
+
+    if sys.platform == "darwin":
+        tags = _macos_apple_languages()
+        logger.debug("系统语言检测输入 (macOS AppleLanguages): %s", tags)
+        for tag in tags:
+            detected = _language_from_ui_tag(tag)
+            if detected is not None:
+                return detected
+        return Language.ENGLISH
+
+    system_locale = QLocale.system()
+    logger.debug(
+        "系统语言检测输入: uiLanguages=%s locale=%s",
+        list(system_locale.uiLanguages()),
+        system_locale.name(),
+    )
+    for tag in system_locale.uiLanguages():
+        detected = _language_from_ui_tag(str(tag))
+        if detected is not None:
+            return detected
+
+    language = system_locale.language()
+    country = system_locale.country()
+
+    if language == QLocale.Language.Chinese:
+        if country in (
+            QLocale.Country.HongKong,
+            QLocale.Country.Macao,
+            QLocale.Country.Taiwan,
+        ):
+            return Language.CHINESE_TRADITIONAL
+        return Language.CHINESE_SIMPLIFIED
+
+    if language == QLocale.Language.Japanese:
+        return Language.JAPANESE
+
+    return Language.ENGLISH
+
+
+def init_language_on_first_run():
+    """初次运行时自动检测并设置系统语言
+
+    仅在未设置过语言时执行（通过 language_auto_detected 标记判断）
+    """
+    if not cfg.get(cfg.language_auto_detected):
+        detected_lang = detect_system_language()
+        cfg.set(cfg.language, detected_lang)
+        cfg.set(cfg.language_auto_detected, True)
+        from app.utils.logger import logger
+
+        logger.info(f"首次启动，自动检测系统语言: {detected_lang}")
+    else:
+        from app.utils.logger import logger
+
+        logger.debug("已设置语言偏好，跳过自动检测")

@@ -1,0 +1,21 @@
+name: mirrorchyan_release_note
+
+on:
+  workflow_dispatch:
+  release:
+    types: [edited]
+
+jobs:
+  mirrorchyan:
+    # UI 暂不向 MirrorChyan 上传
+    if: false
+    # if: github.repository_owner == 'hoey94'
+    runs-on: macos-latest
+
+    steps:
+      - id: uploading
+        uses: MirrorChyan/release-note-action@v1
+        with:
+          mirrorchyan_rid: mfw-licence
+          upload_token: ${{ secrets.MirrorChyanUploadToken }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,821 @@
+import jsonc
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from PySide6.QtCore import QCoreApplication
+
+from app.utils.logger import logger
+from app.common.constants import (
+    _PRETASK_,
+    _RESOURCE_,
+    _CONTROLLER_,
+    _SETTING_,
+    POST_ACTION,
+    PRE_CONFIGURATION,
+)
+from app.core.item import ConfigItem, TaskItem, CoreSignalBus
+from app.core.utils.option_branches_compat import normalize_config_item_branches
+
+
+class ConfigLoadError(RuntimeError):
+    """Raised when a persisted configuration file cannot be decoded or read."""
+
+    def __init__(self, path: Path, cause: Exception) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"无法读取配置文件 {path}: {cause}")
+
+
+class JsonConfigRepository:
+    """JSON配置存储库实现"""
+
+    def __init__(
+        self,
+        main_config_path: Path,
+        configs_dir: Path,
+        interface: Optional[Dict[str, Any]] = None,
+    ):
+        self.main_config_path = main_config_path
+        self.configs_dir = configs_dir
+        self.interface = interface or {}
+
+        # 确保目录存在
+        if not self.configs_dir.exists():
+            self.configs_dir.mkdir(parents=True)
+
+        if not self.main_config_path.exists():
+            # 如果 interface 为空，说明加载失败
+            if not self.interface:
+                interface_path_jsonc = Path.cwd() / "interface.jsonc"
+                interface_path_json = Path.cwd() / "interface.json"
+
+                # 检查配置文件是否存在
+                if (
+                    not interface_path_jsonc.exists()
+                    and not interface_path_json.exists()
+                ):
+                    raise FileNotFoundError(
+                        QCoreApplication.translate(
+                            "",
+                            "No valid resource configuration file found: {path_jsonc} or {path_json}\nYou downloaded the single UI, please download the resource file from the corresponding tool.",
+                        ).format(
+                            path_jsonc=interface_path_jsonc,
+                            path_json=interface_path_json,
+                        )
+                    )
+
+            logger.debug("使用 interface 配置创建默认主配置")
+
+            bundle_name = self.interface.get("name", "Default Bundle")
+            # 统一主配置中的 bundle 结构为：{ bundle_name: { "name": ..., "path": ... } }
+            default_main_config = {
+                "curr_config_id": "",
+                "config_list": [],
+                "bundle": {
+                    bundle_name: {
+                        "name": bundle_name,
+                        "path": "./",
+                    }
+                },
+            }
+            self.save_main_config(default_main_config)
+
+    @staticmethod
+    def _load_json(path: Path) -> Dict[str, Any]:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                return jsonc.load(handle)
+        except (OSError, UnicodeDecodeError, jsonc.JSONDecodeError) as exc:
+            raise ConfigLoadError(path, exc) from exc
+
+    def load_main_config(self) -> Dict[str, Any]:
+        """加载主配置。"""
+        return self._load_json(self.main_config_path)
+
+    def save_main_config(self, config_data: Dict[str, Any]) -> bool:
+        """保存主配置。"""
+        with self.main_config_path.open("w", encoding="utf-8") as handle:
+            jsonc.dump(config_data, handle, indent=4, ensure_ascii=False)
+        return True
+
+    def load_config(self, config_id: str) -> Dict[str, Any]:
+        """加载子配置。"""
+        return self._load_json(self.configs_dir / f"{config_id}.json")
+
+    def save_config(self, config_id: str, config_data: Dict[str, Any]) -> bool:
+        """保存子配置。"""
+        config_file = self.configs_dir / f"{config_id}.json"
+        with config_file.open("w", encoding="utf-8") as handle:
+            jsonc.dump(config_data, handle, indent=4, ensure_ascii=False)
+        return True
+
+    def delete_config(self, config_id: str) -> bool:
+        """删除子配置。"""
+        config_file = self.configs_dir / f"{config_id}.json"
+        if not config_file.exists():
+            raise FileNotFoundError(f"配置文件 {config_file} 不存在")
+        config_file.unlink()
+        return True
+
+    def list_configs(self) -> List[str]:
+        """列出所有子配置ID。"""
+        return [f.stem for f in self.configs_dir.glob("*.json") if f.is_file()]
+
+
+class ConfigService:
+    """配置服务实现"""
+
+    @staticmethod
+    def _usable_presets_from_interface(interface: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw = interface.get("preset", []) if isinstance(interface, dict) else []
+        if not isinstance(raw, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for p in raw:
+            if not isinstance(p, dict):
+                continue
+            rk = p.get("name")
+            if not isinstance(rk, str) or not rk.strip():
+                continue
+            if rk.strip().lower() == "default":
+                continue
+            out.append(p)
+        return out
+
+    @staticmethod
+    def _unique_display_name(base: str, used: set[str]) -> str:
+        b = base.strip() or "Config"
+        if b not in used:
+            return b
+        i = 2
+        while f"{b} ({i})" in used:
+            i += 1
+        return f"{b} ({i})"
+
+    def __init__(self, config_repo: JsonConfigRepository, signal_bus: CoreSignalBus):
+        self.repo = config_repo
+        self.signal_bus = signal_bus
+        self._main_config: Optional[Dict[str, Any]] = None
+        self._config_changed_callback: Optional[Callable[[str], None]] = None
+        # 首次无主配置：仅「Default Config」一条时，供协调器再按 preset 追加子配置
+        self._bootstrap_without_curr_config: bool = False
+        # 首次无主配置：interface 有可物化 preset 时，已创建 N 条子配置，供协调器逐条 init + apply_preset
+        self._bootstrap_preset_pairs: List[Tuple[str, str]] = []
+
+        # 加载主配置
+        self.load_main_config()
+        if self._main_config and not self._main_config.get("curr_config_id"):
+
+            # 从主配置中选取第一个 bundle，生成默认子配置
+            bundle_dict = self._main_config.get("bundle", {}) or {}
+            first_bundle_name = next(iter(bundle_dict.keys()), "Default Bundle")
+
+            interface = self.repo.interface if isinstance(self.repo.interface, dict) else {}
+            usable = self._usable_presets_from_interface(interface)
+
+            if usable:
+                self._main_config.setdefault("config_list", [])
+                first_id: Optional[str] = None
+                used_display: set[str] = set()
+                for preset in usable:
+                    preset_key = str(preset.get("name", "")).strip()
+                    base_label = str(
+                        preset.get("label") or preset.get("name") or preset_key
+                    ).strip() or preset_key
+                    display = self._unique_display_name(base_label, used_display)
+                    used_display.add(display)
+                    cfg = ConfigItem(
+                        name=display,
+                        item_id=ConfigItem.generate_id(),
+                        tasks=[],
+                        know_task=[],
+                        bundle=first_bundle_name,
+                        interface_task_list_materialized=False,
+                    )
+                    self._main_config["config_list"].append(cfg.item_id)
+                    cid = self.create_config(cfg)
+                    if cid:
+                        self._bootstrap_preset_pairs.append((cid, preset_key))
+                        if first_id is None:
+                            first_id = cid
+                if first_id:
+                    self._main_config["curr_config_id"] = first_id
+                    self.save_main_config()
+            else:
+                default_config_item = ConfigItem(
+                    name="Default Config",
+                    item_id=ConfigItem.generate_id(),
+                    tasks=[],
+                    know_task=[],
+                    bundle=first_bundle_name,
+                    interface_task_list_materialized=False,
+                )
+
+                self._main_config["config_list"].append(default_config_item.item_id)
+                self._main_config["curr_config_id"] = default_config_item.item_id
+                self.current_config_id = self.create_config(default_config_item)
+                self._bootstrap_without_curr_config = True
+
+    def consume_bootstrap_preset_pairs(self) -> List[Tuple[str, str]]:
+        """取出并清空「按 preset 已创建的子配置」列表 (config_id, preset_name)。"""
+        pairs = list(self._bootstrap_preset_pairs)
+        self._bootstrap_preset_pairs = []
+        return pairs
+
+    def consume_bootstrap_without_curr_config(self) -> bool:
+        """若本次构造曾因无主配置而创建默认子配置，返回 True 且仅消费一次。"""
+        if self._bootstrap_without_curr_config:
+            self._bootstrap_without_curr_config = False
+            return True
+        return False
+
+    def register_on_change(self, callback: Callable[[str], None]) -> None:
+        """注册配置变更回调，供服务协调器触发内部同步。"""
+        self._config_changed_callback = callback
+
+    def load_main_config(self) -> bool:
+        """加载主配置。"""
+        self._main_config = self.repo.load_main_config()
+        return True
+
+    def save_main_config(self) -> bool:
+        """保存主配置"""
+        if self._main_config is None:
+            print("没有主配置可保存")
+            return False
+
+        return self.repo.save_main_config(self._main_config)
+
+    @property
+    def current_config_id(self) -> str:
+        """获取当前配置ID"""
+        return self._main_config.get("curr_config_id", "") if self._main_config else ""
+
+    @current_config_id.setter
+    def current_config_id(self, value: str) -> bool:
+        """设置当前配置ID"""
+        if self._main_config is None:
+            return False
+
+        # 验证配置ID是否存在
+        if value and value not in self._main_config.get("config_list", []):
+            print(f"配置ID {value} 不存在")
+            return False
+
+        previous_value = self._main_config.get("curr_config_id", "")
+        self._main_config["curr_config_id"] = value
+
+        # 只有持久化成功后才对外发布配置切换。保存失败时恢复内存状态，
+        # 避免调用方误以为目标配置已经激活。
+        if not self.save_main_config():
+            self._main_config["curr_config_id"] = previous_value
+            return False
+
+        if self._config_changed_callback:
+            try:
+                self._config_changed_callback(value)
+            except Exception as exc:
+                logger.error(f"配置变更回调执行失败: {exc}")
+        self.signal_bus.config_changed.emit(value)
+        return True
+
+    def _get_first_interface_name(self, key: str) -> str:
+        items = self.repo.interface.get(key, []) if isinstance(self.repo.interface, dict) else []
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            return str(items[0].get("name", "") or "")
+        return ""
+
+    def _make_base_task(self, item_id: str, task_option: Dict[str, Any] | None = None) -> TaskItem:
+        names = {
+            _PRETASK_: "PreTask",
+            _CONTROLLER_: "Controller",
+            _RESOURCE_: "Resource",
+            POST_ACTION: "Post-Action",
+        }
+        return TaskItem(
+            name=names.get(item_id, item_id),
+            item_id=item_id,
+            is_checked=True,
+            task_option=dict(task_option or {}),
+        )
+
+    def _ensure_base_task_order(self, config: ConfigItem) -> bool:
+        """Ensure PreTask, Controller, Resource prefix and Post-Action suffix."""
+        if not config or not isinstance(config.tasks, list):
+            return False
+        changed = False
+        first_by_id: Dict[str, TaskItem] = {}
+        normal_tasks: List[TaskItem] = []
+        for task in config.tasks:
+            if task.item_id in (_PRETASK_, _CONTROLLER_, _RESOURCE_, POST_ACTION):
+                if task.item_id not in first_by_id:
+                    first_by_id[task.item_id] = task
+                else:
+                    changed = True
+            elif task.item_id == _SETTING_:
+                changed = True
+            else:
+                normal_tasks.append(task)
+
+        if _PRETASK_ not in first_by_id:
+            first_by_id[_PRETASK_] = self._make_base_task(_PRETASK_, {})
+            changed = True
+        if _CONTROLLER_ not in first_by_id:
+            first_by_id[_CONTROLLER_] = self._make_base_task(
+                _CONTROLLER_, {"controller_type": self._get_first_interface_name("controller")}
+            )
+            changed = True
+        if _RESOURCE_ not in first_by_id:
+            first_by_id[_RESOURCE_] = self._make_base_task(
+                _RESOURCE_, {"resource": self._get_first_interface_name("resource")}
+            )
+            changed = True
+        if POST_ACTION not in first_by_id:
+            first_by_id[POST_ACTION] = self._make_base_task(POST_ACTION, {})
+            changed = True
+
+        ordered = [
+            first_by_id[_PRETASK_],
+            first_by_id[_CONTROLLER_],
+            first_by_id[_RESOURCE_],
+            *normal_tasks,
+            first_by_id[POST_ACTION],
+        ]
+        if [t.item_id for t in ordered] != [t.item_id for t in config.tasks]:
+            changed = True
+        config.tasks = ordered
+        return changed
+
+    def get_config(self, config_id: str) -> Optional[ConfigItem]:
+        """获取指定配置"""
+        config_data = self.repo.load_config(config_id)
+        if not config_data:
+            return None
+
+        config = ConfigItem.from_dict(config_data)
+        
+        # 向后兼容：检查并转换旧的 Pre-Configuration 任务
+        changed = self._migrate_pre_configuration_task(config)
+        # 向后兼容：将历史 setting/global 选项统一迁移到 Resource.setting_options
+        changed = self._migrate_global_options_storage(config) or changed
+        changed = self._ensure_base_task_order(config) or changed
+        # 向后兼容：将历史 `children` 字段更正为 `branches`
+        branches_changed = normalize_config_item_branches(config)
+        if branches_changed:
+            changed = True
+        if changed:
+            self.repo.save_config(config.item_id, config.to_dict())
+        
+        return config
+
+    def get_current_config(self) -> ConfigItem:
+        """获取当前配置"""
+        if not self.current_config_id:
+            raise ValueError("当前配置ID为空")
+        config = self.get_config(self.current_config_id)
+        if not config:
+            raise ValueError("当前配置不存在")
+        return config
+
+    def save_config(self, config_id: str, config_data: ConfigItem) -> bool:
+        """保存指定配置"""
+        if self._main_config is None:
+            return False
+
+        # 如果配置ID不在主配置列表中，添加到主配置
+        if config_id not in self._main_config.get("config_list", []):
+            self._main_config["config_list"].append(config_id)
+            self.save_main_config()
+
+        # config_data 应为 ConfigItem，直接转换为 dict 保存
+        return self.repo.save_config(config_id, config_data.to_dict())
+
+    def rename_config(self, config_id: str, new_name: str) -> bool:
+        """重命名配置，由 Service 修改 ConfigItem 并持久化。"""
+        normalized_name = str(new_name or "").strip()
+        if not config_id or not normalized_name:
+            return False
+
+        config = self.get_config(config_id)
+        if not config:
+            return False
+        if config.name == normalized_name:
+            return True
+
+        config.name = normalized_name
+        return self.update_config(config_id, config)
+
+    def create_config(self, config: ConfigItem) -> str:
+        """创建新配置，统一使用 uuid 生成 id"""
+        if not config.item_id:
+            config.item_id = ConfigItem.generate_id()
+
+        # If no tasks provided, add base tasks only.
+        # Task generation from interface should be handled by TaskService
+        init_controller = self.repo.interface["controller"][0]["name"]
+        init_resource = self.repo.interface["resource"][0]["name"]
+        if not config.tasks:
+            default_tasks = [
+                TaskItem(
+                    name="PreTask",
+                    item_id=_PRETASK_,
+                    is_checked=True,
+                    task_option={},
+                ),
+                TaskItem(
+                    name="Controller",
+                    item_id=_CONTROLLER_,
+                    is_checked=True,
+                    task_option={
+                        "controller_type": init_controller,
+                    },
+                ),
+                TaskItem(
+                    name="Resource",
+                    item_id=_RESOURCE_,
+                    is_checked=True,
+                    task_option={
+                        "resource": init_resource,
+                        "setting_options": {},
+                    },
+                ),
+                TaskItem(
+                    name="Post-Action",
+                    item_id=POST_ACTION,
+                    is_checked=True,
+                    task_option={},
+                ),
+            ]
+            config.tasks = default_tasks
+
+        if self.save_config(config.item_id, config):
+            return config.item_id
+        return ""
+
+    def update_config(self, config_id: str, config_data: ConfigItem) -> bool:
+        """更新配置"""
+        return self.save_config(config_id, config_data)
+
+    def _interface_options(self) -> Dict[str, Any]:
+        interface = self.repo.interface if isinstance(self.repo.interface, dict) else {}
+        options = interface.get("option", {})
+        return options if isinstance(options, dict) else {}
+
+    def get_current_setting_options(self) -> Dict[str, Any]:
+        """获取当前配置的 setting 选项（统一存储于 Resource.task_option.setting_options）。"""
+        from app.core.utils.option_secret import decrypt_option_tree
+
+        config = self.get_current_config()
+        resource_task = next((task for task in config.tasks if task.item_id == _RESOURCE_), None)
+        stored: Dict[str, Any] = {}
+        if resource_task and isinstance(resource_task.task_option, dict):
+            setting_options = resource_task.task_option.get("setting_options")
+            if isinstance(setting_options, dict):
+                stored = dict(setting_options)
+            else:
+                # 向后兼容：迁移前可能仍在 Resource.global_options
+                legacy_nested = resource_task.task_option.get("global_options")
+                if isinstance(legacy_nested, dict):
+                    stored = dict(legacy_nested)
+
+        if not stored:
+            # 向后兼容：历史根层 global_options
+            legacy_root = getattr(config, "global_options", {})
+            if isinstance(legacy_root, dict):
+                stored = dict(legacy_root)
+
+        revealed = decrypt_option_tree(stored, self._interface_options())
+        return revealed if isinstance(revealed, dict) else {}
+
+    def update_current_setting_options(self, setting_options: Dict[str, Any]) -> bool:
+        """更新当前配置的 setting 选项（写入 Resource.task_option.setting_options）。"""
+        config = self.get_current_config()
+        self._ensure_base_task_order(config)
+        resource_task = next((task for task in config.tasks if task.item_id == _RESOURCE_), None)
+        if resource_task is None:
+            return False
+        if not isinstance(resource_task.task_option, dict):
+            resource_task.task_option = {}
+        resource_task.task_option["setting_options"] = (
+            dict(setting_options) if isinstance(setting_options, dict) else {}
+        )
+        resource_task.task_option.pop("global_options", None)
+        config.global_options = {}
+        success = self.update_config(config.item_id, config)
+        if success:
+            self.signal_bus.option_updated.emit(dict(setting_options))
+        return success
+
+    def get_current_global_options(self) -> Dict[str, Any]:
+        """兼容旧 API：全局选项现从 Setting 任务读取。"""
+        return self.get_current_setting_options()
+
+    def update_current_global_options(self, global_options: Dict[str, Any]) -> bool:
+        """兼容旧 API：全局选项现写入 Setting 任务。"""
+        return self.update_current_setting_options(global_options)
+
+    def delete_config(self, config_id: str) -> bool:
+        """删除配置（禁止删除最后一个配置）"""
+        if self._main_config is None:
+            return False
+
+        # 从主配置列表中移除
+        if config_id in self._main_config.get("config_list", []):
+            self._main_config["config_list"].remove(config_id)
+
+            # 如果删除的是当前配置，需要更新当前配置
+            if self.current_config_id == config_id:
+                if self._main_config["config_list"]:
+                    self.current_config_id = self._main_config["config_list"][0]
+                else:
+                    self.current_config_id = ""
+
+            # 保存主配置
+            self.save_main_config()
+
+        # 删除子配置文件
+        return self.repo.delete_config(config_id)
+
+    def list_configs(self) -> List[Dict[str, Any]]:
+        """列出所有配置的概要信息"""
+        if self._main_config is None:
+            return []
+        configs = []
+        for config_id in self._main_config.get("config_list", []):
+            config_data = self.repo.load_config(config_id)
+            if config_data:
+                # 只返回概要信息，不包含任务详情
+                summary = {"item_id": config_id, "name": config_data.get("name", "")}
+                configs.append(summary)
+        return configs
+
+    def get_bundle(self, bundle_name: str) -> dict:
+        """获取bundle数据（新格式：bundle为dict，key为名字）"""
+        if self._main_config and "bundle" in self._main_config:
+            bundle = self._main_config["bundle"]
+            if isinstance(bundle, dict) and bundle_name in bundle:
+                return bundle[bundle_name]
+        raise FileNotFoundError(f"Bundle {bundle_name} not found")
+
+    def list_bundles(self) -> List[str]:
+        """列出所有bundle名称（新格式：bundle为dict，key为名字）"""
+        if self._main_config and "bundle" in self._main_config:
+            bundle = self._main_config["bundle"]
+            if isinstance(bundle, dict):
+                return list(bundle.keys())
+        return []
+
+    def update_bundle(
+        self,
+        bundle_name: str,
+        path: str,
+        display_name: str | None = None,
+    ) -> bool:
+        """新增或更新主配置中的 bundle 索引。"""
+        if self._main_config is None or not bundle_name:
+            return False
+        bundles = self._main_config.setdefault("bundle", {})
+        if not isinstance(bundles, dict):
+            bundles = {}
+            self._main_config["bundle"] = bundles
+        current = bundles.get(bundle_name, {})
+        if not isinstance(current, dict):
+            current = {}
+        current["path"] = path
+        current["name"] = display_name or str(current.get("name") or bundle_name)
+        bundles[bundle_name] = current
+        return self.save_main_config()
+
+    def delete_bundle(self, bundle_name: str) -> bool:
+        """从主配置移除 bundle 索引，不删除资源目录。"""
+        if self._main_config is None:
+            return False
+        bundles = self._main_config.get("bundle", {})
+        if not isinstance(bundles, dict) or bundle_name not in bundles:
+            return True
+        bundles.pop(bundle_name, None)
+        self._main_config["bundle"] = bundles
+        return self.save_main_config()
+
+    def get_current_bundle(self) -> dict:
+        """获取当前bundle"""
+        # 使用当前配置中保存的 bundle 名称，在主配置中查找 bundle 详情
+        current_config = self.get_current_config()
+        bundle_name = current_config.bundle
+        return self.get_bundle(bundle_name)
+
+    # ========== bundle 辅助方法 ==========
+
+    def get_bundle_info_for_config(self, config: ConfigItem) -> Dict[str, str] | None:
+        """根据配置对象获取规范化的 bundle 信息（name/path）。"""
+        if not config:
+            return None
+
+        bundle_name = config.bundle
+        if not bundle_name:
+            return None
+
+        try:
+            bundle_raw = self.get_bundle(bundle_name)
+        except FileNotFoundError as e:
+            logger.warning(f"Bundle {bundle_name} not found in main config: {e}")
+            return None
+
+        name = str(bundle_raw.get("name", bundle_name))
+        path = str(bundle_raw.get("path", "./"))
+        return {"name": name, "path": path}
+
+    def get_bundle_path_for_config(self, config: ConfigItem) -> str:
+        """根据配置对象获取 bundle 路径（失败时返回安全默认值 "./"）。"""
+        info = self.get_bundle_info_for_config(config)
+        if not info:
+            return "./"
+        path = info.get("path") or "./"
+        return str(path)
+
+    def _migrate_pre_configuration_task(self, config: ConfigItem) -> bool:
+        """
+        向后兼容：将旧的 Pre-Configuration 任务迁移为新的 Controller 和 Resource 任务
+        
+        Args:
+            config: 配置对象
+            
+        Returns:
+            bool: 是否进行了迁移
+        """
+        # 查找 Pre-Configuration 任务
+        pre_config_task = None
+        pre_config_index = -1
+        for idx, task in enumerate(config.tasks):
+            if task.item_id == PRE_CONFIGURATION:
+                pre_config_task = task
+                pre_config_index = idx
+                break
+        
+        if pre_config_task is None:
+            return False
+        
+        logger.info(f"检测到旧版本的 Pre-Configuration 任务，开始迁移为新的 Controller 和 Resource 任务")
+        
+        # 从 Pre-Configuration 任务中提取配置
+        pre_config_options = pre_config_task.task_option or {}
+        controller_type = pre_config_options.get("controller_type", "")
+        resource_name = pre_config_options.get("resource", "")
+        
+        # 如果没有配置，使用默认值
+        if not controller_type and self.repo.interface.get("controller"):
+            controller_type = self.repo.interface["controller"][0]["name"]
+        if not resource_name and self.repo.interface.get("resource"):
+            resource_name = self.repo.interface["resource"][0]["name"]
+        
+        # 检查是否已存在 Controller 和 Resource 任务
+        has_controller = any(task.item_id == _CONTROLLER_ for task in config.tasks)
+        has_resource = any(task.item_id == _RESOURCE_ for task in config.tasks)
+        
+        # 先删除旧的 Pre-Configuration 任务（避免索引问题）
+        config.tasks.pop(pre_config_index)
+        logger.info(f"已删除旧的 Pre-Configuration 任务")
+        
+        # 创建或更新 Controller 任务
+        if not has_controller:
+            controller_task = TaskItem(
+                name="Controller",
+                item_id=_CONTROLLER_,
+                is_checked=pre_config_task.is_checked,
+                task_option={
+                    "controller_type": controller_type,
+                },
+            )
+            # 在原来的 Pre-Configuration 位置插入 Controller 任务
+            # 由于已经删除了 Pre-Configuration，索引需要减1
+            insert_index = min(pre_config_index, len(config.tasks))
+            config.tasks.insert(insert_index, controller_task)
+            logger.info(f"已创建 Controller 任务，controller_type: {controller_type}")
+        else:
+            # 如果已存在，更新其配置
+            for task in config.tasks:
+                if task.item_id == _CONTROLLER_:
+                    if controller_type:
+                        task.task_option["controller_type"] = controller_type
+                    logger.info(f"已更新现有 Controller 任务，controller_type: {controller_type}")
+                    break
+        
+        # 创建或更新 Resource 任务
+        if not has_resource:
+            resource_task = TaskItem(
+                name="Resource",
+                item_id=_RESOURCE_,
+                is_checked=pre_config_task.is_checked,
+                task_option={
+                    "resource": resource_name,
+                    "setting_options": {},
+                },
+            )
+            # 在 Controller 任务之后插入 Resource 任务
+            controller_index = next(
+                (idx for idx, task in enumerate(config.tasks) if task.item_id == _CONTROLLER_),
+                -1
+            )
+            if controller_index >= 0:
+                config.tasks.insert(controller_index + 1, resource_task)
+            else:
+                # 如果找不到 Controller，插入到开头
+                config.tasks.insert(0, resource_task)
+            logger.info(f"已创建 Resource 任务，resource: {resource_name}")
+        else:
+            # 如果已存在，更新其配置
+            for task in config.tasks:
+                if task.item_id == _RESOURCE_:
+                    if resource_name:
+                        task.task_option["resource"] = resource_name
+                    if isinstance(task.task_option, dict) and "setting_options" not in task.task_option:
+                        task.task_option["setting_options"] = {}
+                    logger.info(f"已更新现有 Resource 任务，resource: {resource_name}")
+                    break
+        
+        # 保存迁移后的配置
+        if self.save_config(config.item_id, config):
+            logger.info(f"配置迁移完成并已保存")
+            return True
+        else:
+            logger.warning(f"配置迁移完成但保存失败")
+            return False
+
+    def _migrate_global_options_storage(self, config: ConfigItem) -> bool:
+        """将历史全局选项迁移到 Resource.task_option.setting_options。"""
+        changed = False
+        resource_task = next((task for task in config.tasks if task.item_id == _RESOURCE_), None)
+        if resource_task is None:
+            resource_task = self._make_base_task(
+                _RESOURCE_,
+                {
+                    "resource": self._get_first_interface_name("resource"),
+                    "setting_options": {},
+                },
+            )
+            controller_index = next(
+                (idx for idx, task in enumerate(config.tasks) if task.item_id == _CONTROLLER_),
+                -1,
+            )
+            if controller_index >= 0:
+                config.tasks.insert(controller_index + 1, resource_task)
+            else:
+                config.tasks.insert(0, resource_task)
+            changed = True
+        if not isinstance(resource_task.task_option, dict):
+            resource_task.task_option = {}
+            changed = True
+
+        setting_options: Dict[str, Any] = {}
+        existing = resource_task.task_option.get("setting_options")
+        if isinstance(existing, dict):
+            setting_options.update(existing)
+
+        legacy_root = getattr(config, "global_options", {})
+        if isinstance(legacy_root, dict):
+            for key, value in legacy_root.items():
+                if key not in setting_options:
+                    setting_options[key] = value
+                    changed = True
+            if legacy_root:
+                config.global_options = {}
+                changed = True
+
+        task_option = resource_task.task_option
+        legacy_nested = task_option.get("global_options")
+        if isinstance(legacy_nested, dict):
+            for key, value in legacy_nested.items():
+                if key not in setting_options:
+                    setting_options[key] = value
+                    changed = True
+            task_option.pop("global_options", None)
+            changed = True
+
+        # 读取历史 Setting 基础任务的选项
+        legacy_setting_task = next((task for task in config.tasks if task.item_id == _SETTING_), None)
+        if legacy_setting_task is not None and isinstance(legacy_setting_task.task_option, dict):
+            for key, value in legacy_setting_task.task_option.items():
+                if key not in setting_options:
+                    setting_options[key] = value
+                    changed = True
+
+        # 已加载 interface 中 global_option 已转为 setting；收集 setting 引用的 option key，迁移旧扁平值。
+        setting_option_names: set[str] = set()
+        for section in self.repo.interface.get("setting", []) if isinstance(self.repo.interface, dict) else []:
+            if not isinstance(section, dict):
+                continue
+            for name in section.get("option", []) if isinstance(section.get("option"), list) else []:
+                if isinstance(name, str) and name:
+                    setting_option_names.add(name)
+        for option_name in list(setting_option_names):
+            if option_name in task_option:
+                if option_name not in setting_options:
+                    setting_options[option_name] = task_option[option_name]
+                task_option.pop(option_name, None)
+                changed = True
+
+        if task_option.get("setting_options") != setting_options:
+            task_option["setting_options"] = setting_options
+            changed = True
+
+        return changed

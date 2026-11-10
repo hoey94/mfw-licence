@@ -1,0 +1,31 @@
+name: mirrorchyan
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mirrorchyan:
+    # UI 暂不向 MirrorChyan 上传
+    if: false
+    # if: github.repository_owner == 'hoey94'
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [win, macos, linux]
+        arch: [aarch64, x86_64]
+
+    steps:
+      # 包名仍是 mfw-licence-{os}-{arch}-{tag}；扩展名 zip/tar.gz 都要能匹配
+      - uses: MirrorChyan/uploading-action@v1
+        with:
+          filetype: latest-release
+          filename: ${{ format('mfw-licence-{0}-{1}-*', matrix.os, matrix.arch) }}
+          mirrorchyan_rid: mfw-licence
+
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          upload_token: ${{ secrets.MirrorChyanUploadToken }}
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}

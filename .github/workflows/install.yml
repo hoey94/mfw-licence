@@ -1,0 +1,613 @@
+name: install
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+
+  changelog:
+    name: Generate changelog
+    runs-on: ubuntu-latest
+    outputs:
+      release_body: ${{ steps.git-cliff.outputs.content }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Generate a changelog
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff
+        with:
+          config: cliff.toml
+          args: -vv --latest --strip header
+        env:
+          OUTPUT: CHANGES.md
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  meta:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      # 版本规则集中在 tools/release_meta.py：基线取仓库内 __version__.py，
+      # 不读取任何 Release API，也不继承上游版本线。
+      - id: set_tag
+        run: python3 tools/release_meta.py
+
+      # i18n 生成与 LLM 翻译见 .github/workflows/i18n-sync.yml（提交回仓库，避免此处重复翻译）
+    outputs:
+      tag: ${{ steps.set_tag.outputs.tag }}
+      is_release: ${{ steps.set_tag.outputs.is_release }}
+      is_prerelease: ${{ steps.set_tag.outputs.is_prerelease }}
+
+
+  nuitka:
+    needs: meta
+    name: nuitka Build (${{ matrix.platform }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runs-on }}
+    # Nuitka git 标签（与 Nuitka-Action 的 pip git+https 安装一致）；升级时改此处即可
+    env:
+      NUITKA_GIT_REF: "4.2"
+    strategy:
+      matrix:
+        include:
+          - platform: win
+            runs-on: windows-latest
+            arch: x86_64
+            python_arch: x64
+            nuitka_main_mode: standalone
+            nuitka_artifact: build/mfw-release
+          - platform: win
+            runs-on: windows-11-arm
+            arch: aarch64
+            python_arch: arm64
+            nuitka_main_mode: standalone
+            nuitka_artifact: build/mfw-release
+          - platform: linux
+            runs-on: ubuntu-latest
+            arch: x86_64
+            python_arch: x64
+            nuitka_main_mode: onefile
+            nuitka_artifact: build/mfw-release
+          - platform: linux
+            runs-on: ubuntu-24.04-arm
+            arch: aarch64
+            python_arch: arm64
+            nuitka_main_mode: onefile
+            nuitka_artifact: build/mfw-release
+          - platform: macos
+            runs-on: macos-15-intel
+            arch: x86_64
+            python_arch: x64
+            target_arch: x86_64
+            nuitka_main_mode: app-dist
+            nuitka_artifact: build/mfw-release
+          - platform: macos
+            runs-on: macos-latest
+            arch: aarch64
+            python_arch: arm64
+            target_arch: arm64
+            nuitka_main_mode: app-dist
+            nuitka_artifact: build/mfw-release
+
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.python_arch }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: vcpkg clone & bootstrap (Windows ARM64)
+        if: matrix.platform == 'win' && matrix.arch == 'aarch64'
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:GITHUB_WORKSPACE\vcpkg"
+          & "$env:GITHUB_WORKSPACE\vcpkg\bootstrap-vcpkg.bat"
+
+      # 缓存 OpenSSL 等二进制与源码包，避免 ARM64 runner 上每次全量编译
+      - name: Cache vcpkg downloads & installed (Windows ARM64)
+        if: matrix.platform == 'win' && matrix.arch == 'aarch64'
+        uses: actions/cache@v5
+        with:
+          path: |
+            vcpkg/downloads
+            vcpkg/installed
+          key: vcpkg-arm64-openssl-static-md-${{ hashFiles('.github/workflows/install.yml') }}
+          restore-keys: |
+            vcpkg-arm64-openssl-static-md-
+
+      - name: vcpkg OpenSSL + pip deps (Windows ARM64)
+        if: matrix.platform == 'win' && matrix.arch == 'aarch64'
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\vcpkg\vcpkg.exe" install openssl:arm64-windows-static-md
+
+          $opensslRoot = "$env:GITHUB_WORKSPACE\vcpkg\installed\arm64-windows-static-md"
+          $env:VCPKG_ROOT = "$env:GITHUB_WORKSPACE\vcpkg"
+          $env:OPENSSL_DIR = $opensslRoot
+          $env:OPENSSL_LIB_DIR = "$opensslRoot\lib"
+          $env:OPENSSL_INCLUDE_DIR = "$opensslRoot\include"
+
+          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=$env:VCPKG_ROOT"
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_DIR=$env:OPENSSL_DIR"
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_LIB_DIR=$env:OPENSSL_LIB_DIR"
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_INCLUDE_DIR=$env:OPENSSL_INCLUDE_DIR"
+
+          python -m pip install --upgrade pip
+          python -m pip install setuptools wheel maturin
+          python -m pip install -r requirements.txt
+
+      - name: Install Python dependencies
+        if: ${{ !(matrix.platform == 'win' && matrix.arch == 'aarch64') }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Install Nuitka macOS build dependencies
+        if: matrix.platform == 'macos'
+        run: python -m pip install -r requirements-nuitka.txt
+
+      # Intel macOS runner：/usr/local/lib 与 opt/openssl@3 重复 symlink 会令 Nuitka 扫描 FATAL；
+      # cryptography 又依赖 opt/openssl@3，不能 brew remove。
+      - name: Prepare macOS runner for Nuitka OpenSSL scan
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v brew >/dev/null 2>&1; then
+            if ! brew list openssl@3 >/dev/null 2>&1; then
+              brew install openssl@3
+            fi
+          fi
+          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+            for lib in \
+              /usr/local/lib/libcrypto.dylib \
+              /usr/local/lib/libssl.dylib \
+              /usr/local/lib/libcrypto.3.dylib \
+              /usr/local/lib/libssl.3.dylib; do
+              if [[ -L "$lib" ]]; then
+                rm -f "$lib"
+              fi
+            done
+            test -f /usr/local/opt/openssl@3/lib/libssl.3.dylib
+            test -f /usr/local/opt/openssl@3/lib/libcrypto.3.dylib
+          else
+            test -f /opt/homebrew/opt/openssl@3/lib/libssl.3.dylib
+            test -f /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib
+          fi
+          openssl_lib="$(brew --prefix openssl@3)/lib/libcrypto.3.dylib"
+          # pipefail + nm | grep -q 会在 grep 退出后令 LLVM nm 收到 SIGPIPE 而失败
+          openssl_symbols="$(nm -gU "$openssl_lib")"
+          if [[ "$openssl_symbols" != *"_EVP_DigestSqueeze"* ]]; then
+            echo "openssl@3 too old for cryptography: missing _EVP_DigestSqueeze in $openssl_lib"
+            exit 1
+          fi
+
+      - name: Build Qt resource module
+        run: |
+          python -m pip install PySide6
+          python ./tools/lrelease.py
+          python ./tools/rcc_resources.py
+
+      - name: Verify app_rc for Nuitka
+        shell: python
+        run: |
+          import pathlib
+          rc = pathlib.Path("app/resources/app_rc.py")
+          if not rc.is_file():
+              raise SystemExit(f"missing generated Qt resource module: {rc}")
+
+      # 主程序 Nuitka 编译前写入版本
+      - name: Set __version__ for Nuitka compile
+        env:
+          MFW_VERSION: ${{ needs.meta.outputs.tag }}
+        run: python -c "import os; open('app/common/__version__.py','w',encoding='utf-8').write('__version__ = %r\n' % os.environ['MFW_VERSION'])"
+
+      # Nuitka --file-version / --product-version 仅接受至多 4 段无符号整数（如 1.2.3.0），从 tag 推导
+      - name: Compute executable version metadata
+        id: exe_meta
+        shell: python
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          import os
+          import pathlib
+          import re
+
+          tag = os.environ.get("TAG", "v0.0.0").strip()
+          core = tag[1:] if tag.startswith("v") else tag
+          m = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?", core)
+          parts: list[str] = []
+          if m:
+              for g in m.groups():
+                  if g is not None:
+                      parts.append(g)
+          if not parts:
+              parts = ["0"]
+          while len(parts) < 4:
+              parts.append("0")
+          win_ver = ".".join(parts[:4])
+
+          tl = tag.lower()
+          win_console_mode = (
+              "force" if ("ci" in tl or "alpha" in tl) else "disable"
+          )
+
+          out = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          with out.open("a", encoding="utf-8") as f:
+              f.write(f"win_file_version={win_ver}\n")
+              f.write(f"win_product_version={win_ver}\n")
+              f.write(f"win_console_mode={win_console_mode}\n")
+
+      - name: Qt GUI with PySide6 (Windows)
+        if: matrix.platform == 'win'
+        uses: Nuitka/Nuitka-Action@main
+        with:
+          nuitka-version: ${{ env.NUITKA_GIT_REF }}
+          script-name: main.py
+          mode: ${{ matrix.nuitka_main_mode }}
+          lto: no
+          caching-key: mfw-standalone-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.python_arch }}
+          enable-plugins: pyside6
+          windows-console-mode: ${{ steps.exe_meta.outputs.win_console_mode }}
+          windows-icon-from-ico: ./app/assets/icons/logo.ico
+          company-name: ${{ github.repository_owner }}
+          product-name: MFW-ChainFlow Assistant
+          file-version: ${{ steps.exe_meta.outputs.win_file_version }}
+          product-version: ${{ steps.exe_meta.outputs.win_product_version }}
+          file-description: MaaFramework GUI runner (interface v2)
+          copyright: "Copyright (C) ${{ github.repository_owner }} and contributors. Licensed under AGPL-3.0."
+          user-package-configuration-file: nuitka-package.config.yml
+          include-package: |
+            maa
+            PIL
+            MaaAgentBinary
+            app.builtin_tasks
+          include-package-data: MaaAgentBinary
+          include-data-files: |
+            README.md=MFW_README.md
+            README-en.md=MFW_README-en.md
+            LICENSE=MFW_LICENSE
+      - name: Qt GUI with PySide6 (Linux)
+        if: matrix.platform == 'linux'
+        uses: Nuitka/Nuitka-Action@main
+        with:
+          nuitka-version: ${{ env.NUITKA_GIT_REF }}
+          script-name: main.py
+          mode: ${{ matrix.nuitka_main_mode }}
+          lto: no
+          caching-key: mfw-onefile-main-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.python_arch }}
+          enable-plugins: pyside6
+          linux-icon: ./app/assets/icons/logo.png
+          output-file: MFW
+          company-name: ${{ github.repository_owner }}
+          product-name: MFW-ChainFlow Assistant
+          file-version: ${{ steps.exe_meta.outputs.win_file_version }}
+          product-version: ${{ steps.exe_meta.outputs.win_product_version }}
+          file-description: MaaFramework GUI runner (interface v2)
+          copyright: "Copyright (C) ${{ github.repository_owner }} and contributors. Licensed under AGPL-3.0."
+          user-package-configuration-file: nuitka-package.config.yml
+          include-package: |
+            maa
+            PIL
+            MaaAgentBinary
+            app.builtin_tasks
+          include-package-data: MaaAgentBinary
+      - name: Qt GUI with PySide6 (macOS)
+        if: matrix.platform == 'macos'
+        uses: Nuitka/Nuitka-Action@main
+        with:
+          nuitka-version: ${{ env.NUITKA_GIT_REF }}
+          script-name: main.py
+          mode: ${{ matrix.nuitka_main_mode }}
+          lto: no
+          caching-key: mfw-app-dist-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.python_arch }}
+          enable-plugins: pyside6
+          macos-target-arch: ${{ matrix.target_arch }}
+          macos-app-icon: ./app/assets/icons/logo.png
+          macos-signed-app-name: com.hoey94.mfw-licence
+          macos-app-name: MFW-ChainFlow Assistant
+          macos-app-mode: gui
+          macos-app-console-mode: disable
+          macos-app-version: ${{ steps.exe_meta.outputs.win_product_version }}
+          company-name: ${{ github.repository_owner }}
+          product-name: MFW-ChainFlow Assistant
+          file-version: ${{ steps.exe_meta.outputs.win_file_version }}
+          product-version: ${{ steps.exe_meta.outputs.win_product_version }}
+          file-description: MaaFramework GUI runner (interface v2)
+          copyright: "Copyright (C) ${{ github.repository_owner }} and contributors. Licensed under AGPL-3.0."
+          user-package-configuration-file: nuitka-package.config.yml
+          include-package: |
+            maa
+            PIL
+            app.builtin_tasks
+          include-module: MaaAgentBinary
+          include-data-files: |
+            README.md=MFW_README.md
+            README-en.md=MFW_README-en.md
+            LICENSE=MFW_LICENSE
+            AUTHORS.md=MFW_AUTHORS.md
+      # standalone：main.dist 内为 maa/bin；迁入 mfw-release 后执行 move_maa_bin_to_maafw，与 MAAFW_BINARY_PATH=maafw 一致
+      - name: Assemble mfw-release (Windows)
+        if: matrix.platform == 'win'
+        shell: pwsh
+        run: |
+          $rel = Join-Path "build" "mfw-release"
+          $srcDist = Join-Path "build" "main.dist"
+          $mainBuilt = Join-Path $srcDist "main.exe"
+          if (-not (Test-Path -LiteralPath $srcDist -PathType Container)) { Write-Error "missing $srcDist"; Get-ChildItem -LiteralPath build; exit 1 }
+          if (-not (Test-Path -LiteralPath $mainBuilt -PathType Leaf)) { Write-Error "missing $mainBuilt"; Get-ChildItem -LiteralPath $srcDist; exit 1 }
+          New-Item -ItemType Directory -Force $rel | Out-Null
+          Copy-Item -Path (Join-Path $srcDist '*') -Destination $rel -Recurse -Force
+          Rename-Item -LiteralPath (Join-Path $rel "main.exe") -NewName "MFW.exe" -Force
+          python tools/packaging/move_maa_bin_to_maafw.py $rel
+
+      - name: Assemble mfw-release (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        env:
+          MFW_VERSION: ${{ needs.meta.outputs.tag }}
+          MFW_WIN_VER: ${{ steps.exe_meta.outputs.win_file_version }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          rel="build/mfw-release"
+          src_dist="build/main.dist"
+          onefile=""
+          for cand in build/MFW build/main.bin build/main; do
+            if [[ -f "$cand" ]]; then
+              onefile="$cand"
+              break
+            fi
+          done
+          if [[ -z "$onefile" ]]; then echo "missing Linux onefile"; ls -la build; exit 1; fi
+          if [[ ! -d "$src_dist" ]]; then echo "missing $src_dist (Nuitka onefile intermediate)"; ls -la build; exit 1; fi
+          mkdir -p "$rel"
+          cp -a "$onefile" "$rel/MFW"
+          chmod +x "$rel/MFW"
+          # onefile 运行时 cwd 为发行根；maa 原生库仍须外置 maafw/（MAAFW_BINARY_PATH）
+          python3 tools/packaging/move_maa_bin_to_maafw.py "$src_dist" "$rel"
+          cp README.md "$rel/MFW_README.md"
+          cp README-en.md "$rel/MFW_README-en.md"
+          cp LICENSE "$rel/MFW_LICENSE"
+          cp AUTHORS.md "$rel/MFW_AUTHORS.md"
+          mkdir -p "$rel/app/assets/icons"
+          cp app/assets/icons/logo.png "$rel/app/assets/icons/logo.png"
+          test -x "$rel/MFW"
+          test -f "$rel/maafw/libMaaFramework.so"
+
+          python3 << 'PY'
+          import datetime as _dt
+          import os
+          import pathlib
+          import xml.sax.saxutils as _xml
+
+          main = pathlib.Path("build/mfw-release")
+          tag_plain = os.environ.get("MFW_VERSION", "")
+          tag_xml = _xml.escape(tag_plain)
+          win_ver_plain = os.environ.get("MFW_WIN_VER", "0.0.0.0")
+          win_ver_xml = _xml.escape(win_ver_plain)
+          owner = _xml.escape(os.environ.get("GITHUB_REPOSITORY_OWNER", ""))
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          home = _xml.escape(f"https://github.com/{repo}")
+
+          launcher = """#!/usr/bin/env sh
+          HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+          cd "$HERE" || exit 1
+          exec ./MFW "$@"
+          """
+          (main / "run-mfw.sh").write_text(
+              "\n".join(line.lstrip() for line in launcher.strip().splitlines()) + "\n",
+              encoding="utf-8",
+          )
+          (main / "run-mfw.sh").chmod(0o755)
+
+          desktop = f"""[Desktop Entry]
+          Version=1.5
+          Type=Application
+          Terminal=false
+          Categories=Utility;Development;
+          StartupWMClass=MFW
+          Name=MFW-ChainFlow Assistant
+          Name[zh_CN]=链程助手
+          GenericName=MaaFramework GUI
+          Comment=Visual runner for MaaFramework automation (interface v2). Build tag: {tag_plain}
+          Comment[zh_CN]=基于 MaaFramework 的可视化自动化运行器（interface v2）。构建标识：{tag_plain}
+          Keywords=maa;MaaFramework;automation;PySide6;
+          Icon=app/assets/icons/logo.png
+          Exec=./run-mfw.sh
+          """
+          (main / "io.github.hoey94.mfw-licence.desktop").write_text(
+              "\n".join(line.lstrip() for line in desktop.strip().splitlines()) + "\n",
+              encoding="utf-8",
+          )
+
+          today = _dt.datetime.now(_dt.UTC).date().isoformat()
+          metainfo_dir = main / "share" / "metainfo"
+          metainfo_dir.mkdir(parents=True, exist_ok=True)
+          xml_body = f"""<?xml version="1.0" encoding="UTF-8"?>
+          <component type="desktop-application">
+            <id>io.github.hoey94.mfw-licence</id>
+            <metadata_license>MIT</metadata_license>
+            <project_license>AGPL-3.0-or-later</project_license>
+            <name>MFW-ChainFlow Assistant</name>
+            <name xml:lang="zh_CN">链程助手</name>
+            <summary>Visual runner for MaaFramework automation (interface v2)</summary>
+            <summary xml:lang="zh_CN">基于 MaaFramework 的可视化自动化运行器（interface v2）</summary>
+            <developer_name>{owner}</developer_name>
+            <url type="homepage">{home}</url>
+            <url type="bugtracker">{home}/issues</url>
+            <launchable type="desktop-id">io.github.hoey94.mfw-licence.desktop</launchable>
+            <releases>
+              <release version="{win_ver_xml}" date="{_xml.escape(today)}">
+                <description>
+                  <p>Build tag: {tag_xml}</p>
+                </description>
+              </release>
+            </releases>
+          </component>
+          """
+          (metainfo_dir / "io.github.hoey94.mfw-licence.metainfo.xml").write_text(
+              "\n".join(line.lstrip() for line in xml_body.strip().splitlines()) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Assemble mfw-release (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rel="build/mfw-release"
+          src_app="build/main.app"
+          app="$rel/MFW.app"
+          if [[ ! -d "$src_app" ]]; then echo "missing $src_app"; ls -la build; exit 1; fi
+
+          mkdir -p "$rel"
+          cp -R "$src_app" "$app"
+          python3 tools/packaging/patch_macos_info_plist.py "$app"
+          macos_dir="$app/Contents/MacOS"
+          if [[ -f "$macos_dir/main" ]]; then
+            mv "$macos_dir/main" "$macos_dir/MFW"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable MFW" "$app/Contents/Info.plist"
+          elif [[ ! -f "$macos_dir/MFW" ]]; then
+            echo "missing app executable in $macos_dir"; ls -la "$macos_dir"; exit 1
+          fi
+
+          chmod +x "$macos_dir/MFW"
+
+          # Nuitka 不能用 include-package 打 MaaAgentBinary（arm64 ELF .so 会误判为宿主库）；
+          # 组装阶段从 site-packages 拷贝 ADB 代理（minicap/minitouch/maatouch）。
+          python3 tools/packaging/copy_maagentbinary_to_dist.py "$macos_dir/MaaAgentBinary"
+
+          # cryptography 在 CI 上链到 Homebrew OpenSSL 绝对路径，需打入 dylib 并改 @executable_path。
+          python3 tools/packaging/bundle_macos_openssl.py "$macos_dir"
+
+          python3 tools/packaging/move_maa_bin_to_maafw.py "$macos_dir" "$rel"
+
+          mkdir -p "$rel/maafw/maa/bin"
+          for library in "$rel"/maafw/*.dylib; do
+            [[ -f "$library" ]] || continue
+            cp -p "$library" "$rel/maafw/maa/bin/"
+          done
+          if [[ -d "$rel/maafw/plugins" ]]; then
+            cp -R "$rel/maafw/plugins" "$rel/maafw/maa/bin/plugins"
+          fi
+
+          # 外置 maafw 后 @executable_path 仍指向 .app/MacOS，需改为 @loader_path。
+          python3 tools/packaging/fix_maafw_macos_dylib_paths.py "$rel/maafw"
+
+          # install_name_tool 会破坏签名；外置 maafw/ 不在 .app 内，需单独重签。
+          python3 tools/packaging/codesign_macos_release.py "$rel"
+
+          cp README.md "$rel/MFW_README.md"
+          cp README-en.md "$rel/MFW_README-en.md"
+          cp LICENSE "$rel/MFW_LICENSE"
+          cp AUTHORS.md "$rel/MFW_AUTHORS.md"
+
+          # Nuitka 会先签名原始 bundle；移动 dylib 和重命名入口后必须重新封装签名。
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          test -x "$macos_dir/MFW"
+          test -f "$rel/maafw/maa/bin/libMaaFramework.dylib"
+
+      - name: Generate distribution file list
+        run: python tools/packaging/build_nuitka.py --file-list
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mfw-licence-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ matrix.nuitka_artifact }}
+          include-hidden-files: true
+
+  # === 发布 Nuitka 产物 ===
+  release:
+    if: ${{ needs.meta.outputs.is_release == 'true' }}
+    needs: [meta, nuitka, changelog]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: assets
+
+      - run: |
+          cd assets
+          tag="${{ needs.meta.outputs.tag }}"
+          for f in *; do
+            [[ -d "$f" ]] || continue
+            # upload-artifact 可能丢掉 Unix 可执行位；打包前按文件头/已知名字补回
+            python3 - "$f" <<'PY'
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          elf = b"\x7fELF"
+          macho = {
+              b"\xcf\xfa\xed\xfe",
+              b"\xce\xfa\xed\xfe",
+              b"\xca\xfe\xba\xbe",
+              b"\xfe\xed\xfa\xcf",
+              b"\xfe\xed\xfa\xce",
+          }
+          named = {"MFW", "run-mfw.sh", "maapicli", "minicap", "minitouch", "maatouch"}
+          for path in root.rglob("*"):
+              if not path.is_file() or path.is_symlink():
+                  continue
+              with path.open("rb") as handle:
+                  header = handle.read(4)
+              if (
+                  path.name in named
+                  or path.suffix == ".sh"
+                  or header == elf
+                  or header in macho
+              ):
+                  path.chmod(path.stat().st_mode | 0o111)
+          PY
+            # zip 不保证还原 Unix 权限；Linux/macOS 用 tar.gz 保留 chmod
+            # cwd 已是 assets：zip 先 cd 进目录所以用 ../；tar 用 -C 所以写当前目录
+            if [[ "$f" == *-win-* ]]; then
+              (cd "$f" && zip -r "../$f-${tag}.zip" .)
+            else
+              tar -czf "$f-${tag}.tar.gz" -C "$f" .
+            fi
+          done
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            assets/*.zip
+            assets/*.tar.gz
+          tag_name: ${{ needs.meta.outputs.tag }}
+          body: ${{ needs.changelog.outputs.release_body }}
+          draft: false
+          prerelease: ${{ needs.meta.outputs.is_prerelease }}
+
+#      - name: Trigger MirrorChyanUploading
+#        if: github.repository_owner == 'hoey94'
+#        run: |
+#          gh workflow run --repo $GITHUB_REPOSITORY mirrorchyan
+#          gh workflow run --repo $GITHUB_REPOSITORY mirrorchyan_release_note
+#        env:
+#          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
