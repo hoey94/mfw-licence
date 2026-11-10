@@ -110,5 +110,10 @@ class SignalBus(QObject):
     # 任务识别命中 ROI（供监控预览叠加）
     monitor_recognition_roi = Signal(dict)
 
+    # 软件授权：状态快照 / 到期锁定会话 / 到期事件
+    license_status_changed = Signal(object)
+    license_session_locked = Signal()
+    license_expired = Signal(object)
+
 
 signalBus = SignalBus()

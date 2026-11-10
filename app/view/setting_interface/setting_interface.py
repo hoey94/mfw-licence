@@ -429,6 +429,7 @@ class SettingInterface(QWidget):
         self.scroll_content_layout.addWidget(self.Setting_scroll_widget)
         self.scroll_area.setWidget(self.scroll_content)
 
+        self.initialize_license_settings()
         self.initialize_start_settings()
         self.initialize_task_settings()
         self.initialize_notice_settings()
@@ -893,6 +894,19 @@ class SettingInterface(QWidget):
         向 ExpandLayout 插入设置卡片组。
         """
         self.Setting_expand_layout.addWidget(group_widget)
+
+    def initialize_license_settings(self):
+        """软件授权详情页：机器码 / 试用码 / 激活码更新 / 状态与倒计时。
+
+        本仓库设置页是「滚动区 + 分组」而非左侧二级菜单，故把授权详情页作为
+        设置页最顶部的独立分区；首次启动门禁弹窗复用同一个 LicensePage。
+        """
+        from app.view.license_interface.license_widgets import LicensePage
+
+        self.license_page = LicensePage(parent=self.scroll_content)
+        # ExpandLayout 以 w.height() 排布子控件，普通 QWidget 会被压成 30px，
+        # 因此改用标准 QVBoxLayout，插在更新头部之后、其它设置分组之前。
+        self.scroll_content_layout.insertWidget(1, self.license_page)
 
     def initialize_start_settings(self):
         """构建启动设置组，与旧版保持一致的外层包裹。"""

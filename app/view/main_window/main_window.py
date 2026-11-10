@@ -341,6 +341,10 @@ class MainWindow(MSFluentWindow):
         multi_config_path = Path.cwd() / "config" / "multi_config.json"
         self.service_coordinator = ServiceCoordinator(multi_config_path)
 
+        # 授权到期：立即停止全部运行时任务并锁定会话
+        self._license_session_locked = False
+        signalBus.license_session_locked.connect(self._on_license_session_locked)
+
         self._announcement_pending_show = False
         # 多资源适配开启时：公告功能彻底关闭（不加载、不比对、不自动弹窗、无入口）
         self._announcement_enabled = not bool(cfg.get(cfg.multi_resource_adaptation))
@@ -3208,6 +3212,24 @@ class MainWindow(MSFluentWindow):
             cfg.last_window_geometry,
             f"{geo.x()},{geo.y()},{geo.width()},{geo.height()}",
         )
+
+    def _on_license_session_locked(self) -> None:
+        """授权到期：禁用交互并停止全部运行时任务，等待退出流程接管。"""
+        if self._license_session_locked:
+            return
+        self._license_session_locked = True
+        self.setEnabled(False)
+        try:
+            loop = self._loop
+            if loop is not None and not loop.is_closed():
+                loop.create_task(
+                    self.service_coordinator.shutdown_all_configurations(timeout=3.0),
+                    name="mfw-license-expiry-stop-all",
+                )
+            else:
+                self.service_coordinator.shutdown_all_runtimes_sync()
+        except Exception:
+            logger.exception("授权到期后停止任务失败，将由退出清理流程兜底")
 
     def closeEvent(self, e):
         """关闭事件。资源清理完成前保持窗口存活，避免事件循环提前退出。"""

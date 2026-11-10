@@ -227,6 +227,14 @@ def _run() -> int:
 
     init_language_on_first_run()
 
+    # 软件授权门禁：首次启动强制激活 / 本地授权到期在构建主窗口前拦截
+    from app.utils.license_guard import check_startup_license
+
+    license_outcome = check_startup_license()
+    if license_outcome != "ok":
+        logger.warning("授权门禁未通过，终止启动: %s", license_outcome)
+        return 1
+
     _show_deprecated_cli_if_needed()
 
     # 国际化配置（须在 --force-restart 等待弹窗之后安装，以便弹窗也能翻译）
@@ -378,6 +386,11 @@ def _run() -> int:
     )
     dispatcher.attach_window(w)
     w.show()
+
+    # 运行期授权监护：倒计时到期 -> 锁会话 -> 弹窗 -> 主动退出整个程序
+    from app.utils.license_guard import install_runtime_license_guard
+
+    install_runtime_license_guard(app, dispatcher)
 
     # 连接应用退出信号到事件循环停止
     app.aboutToQuit.connect(loop.stop)

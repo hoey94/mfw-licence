@@ -31,6 +31,9 @@ from maa.define import (
     MaaMacOSInputMethodEnum,
 )
 
+# ADB 连接地址默认值（新建控制器配置与旧配置空值迁移都会使用）
+DEFAULT_ADB_ADDRESS = "127.0.0.1:16384"
+
 
 def _build_method_options_from_enum(
     enum_cls: Type[Any],
@@ -1744,7 +1747,7 @@ class ControllerSettingWidget(QWidget):
         if controller_type == "adb":
             adb_defaults = {
                 "adb_path": "",
-                "address": "",
+                "address": DEFAULT_ADB_ADDRESS,
                 "auto_fill_emulator_launch": False,
                 "emulator_path": "",
                 "emulator_params": "",
@@ -1754,6 +1757,9 @@ class ControllerSettingWidget(QWidget):
                 "config": "{}",
             }
             self._ensure_defaults(controller_cfg, adb_defaults)
+            # 旧配置里 address 已存在但为空时，setdefault 不会覆盖，这里补齐默认值
+            if not str(controller_cfg.get("address") or "").strip():
+                controller_cfg["address"] = DEFAULT_ADB_ADDRESS
         elif controller_type == "win32":
             win32_defaults = {
                 "hwnd": "",
