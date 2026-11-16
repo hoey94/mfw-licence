@@ -220,13 +220,32 @@ class OptionService:
     def _controller_names(self) -> set[str]:
         interface = self.task_service.interface or {}
         controllers = interface.get("controller", [])
-        if not isinstance(controllers, list):
-            return set()
-        return {
-            str(controller.get("name"))
-            for controller in controllers
-            if isinstance(controller, dict) and controller.get("name")
-        }
+        names: set[str] = set()
+        if isinstance(controllers, list):
+            names.update(
+                str(controller.get("name"))
+                for controller in controllers
+                if isinstance(controller, dict) and controller.get("name")
+            )
+        # 首次启动或切换多配置/多资源包时，interface 可能尚未加载或与当前
+        # bundle 不一致。此时仍要保留配置里已有的控制器子配置，否则
+        # ADB 连接地址等字段会被白名单直接丢弃，且无法写回磁盘。
+        get_task = getattr(self.task_service, "get_task", None)
+        task = get_task(_CONTROLLER_) if callable(get_task) else None
+        options = (
+            task.task_option
+            if task is not None and isinstance(getattr(task, "task_option", None), dict)
+            else {}
+        )
+        selected = options.get("controller_type")
+        if isinstance(selected, dict):
+            selected = selected.get("value")
+        if isinstance(selected, str) and selected.strip():
+            names.add(selected.strip())
+        for key, value in options.items():
+            if isinstance(value, dict) and key not in _CONTROLLER_BASE_FIELDS:
+                names.add(str(key))
+        return names
 
     def _sanitize_controller_options(
         self,

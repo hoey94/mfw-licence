@@ -39,6 +39,7 @@ from app.utils.notice import (
 
 from app.utils.logger import logger
 from app.core.service.config_service import ConfigService
+from app.core.utils.controller_defaults import normalize_adb_controller_options
 from app.core.utils.holiday import emit_holiday_startup_logs
 from app.core.utils.win32_methods import (
     resolve_win32_input_method,
@@ -2172,6 +2173,10 @@ class TaskFlowRunner(QObject):
                 controller_raw = {**opt_effective, **controller_raw}
                 break
 
+        # 兜底：后台运行非活动配置、旧配置或 interface 默认值写在顶层时，
+        # 仍要保证 ADB 控制器子配置带有默认连接地址，避免误报「地址为空」。
+        self._ensure_runtime_adb_defaults(controller_raw, controller_name)
+
         # 首选：从"控制器子配置"读取（例如 controller_raw["Win32控制器"]["permission_required"]）
         permission_required = None
         display_short_side = None
@@ -3863,6 +3868,32 @@ class TaskFlowRunner(QObject):
             return old_name == new_name
         else:
             return False
+
+    def _ensure_runtime_adb_defaults(
+        self, controller_raw: Dict[str, Any], controller_name: str
+    ) -> None:
+        """补齐 ADB 默认连接地址并回写当前配置，保证启动时与界面显示一致。"""
+        if not isinstance(controller_raw, dict) or not controller_name:
+            return
+        entry = self._get_interface_controller_entry(controller_name) or {}
+        if str(entry.get("type", "") or "").strip().lower() != "adb":
+            return
+        if not normalize_adb_controller_options(
+            controller_raw, self._runtime_interface, controller_type="adb"
+        ):
+            return
+        logger.info("已为控制器 %s 补齐默认 ADB 连接地址", controller_name)
+        sub_config = controller_raw.get(controller_name)
+        task = self._get_task(_CONTROLLER_)
+        if not isinstance(sub_config, dict) or task is None:
+            return
+        if not isinstance(task.task_option, dict):
+            task.task_option = {}
+        stored = task.task_option.get(controller_name)
+        merged = dict(stored) if isinstance(stored, dict) else {}
+        merged.update(sub_config)
+        task.task_option[controller_name] = merged
+        self._persist_runtime_task_update(task)
 
     def _get_interface_controller_entry(
         self, controller_name: str

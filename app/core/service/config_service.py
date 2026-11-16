@@ -14,6 +14,7 @@ from app.common.constants import (
     PRE_CONFIGURATION,
 )
 from app.core.item import ConfigItem, TaskItem, CoreSignalBus
+from app.core.utils.controller_defaults import normalize_adb_controller_options
 from app.core.utils.option_branches_compat import normalize_config_item_branches
 
 
@@ -346,6 +347,19 @@ class ConfigService:
         config.tasks = ordered
         return changed
 
+    def _normalize_controller_defaults(self, config: ConfigItem) -> bool:
+        """保证每条配置的 ADB 控制器都带有默认连接地址并已落盘。"""
+        changed = False
+        for task in config.tasks:
+            if task.item_id == _CONTROLLER_ and isinstance(task.task_option, dict):
+                changed = (
+                    normalize_adb_controller_options(
+                        task.task_option, self.repo.interface
+                    )
+                    or changed
+                )
+        return changed
+
     def get_config(self, config_id: str) -> Optional[ConfigItem]:
         """获取指定配置"""
         config_data = self.repo.load_config(config_id)
@@ -362,6 +376,9 @@ class ConfigService:
         # 向后兼容：将历史 `children` 字段更正为 `branches`
         branches_changed = normalize_config_item_branches(config)
         if branches_changed:
+            changed = True
+        # 兼容旧配置：UI 曾只在内存中补默认值，磁盘里的控制器可能没有 ADB 地址
+        if self._normalize_controller_defaults(config):
             changed = True
         if changed:
             self.repo.save_config(config.item_id, config.to_dict())
@@ -447,6 +464,10 @@ class ConfigService:
                 ),
             ]
             config.tasks = default_tasks
+
+        # 新建配置（含首次启动的 Default Config 与「+ 添加新配置」）必须把
+        # ADB 默认连接地址写入磁盘，运行时才会重新读到它。
+        self._normalize_controller_defaults(config)
 
         if self.save_config(config.item_id, config):
             return config.item_id
