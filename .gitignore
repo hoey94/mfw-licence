@@ -496,3 +496,7 @@ i18n
 
 # Python virtual environment
 .venv/
+
+# macOS 系统生成文件
+.DS_Store
+._*

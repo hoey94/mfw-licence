@@ -28,6 +28,7 @@ from qfluentwidgets import (
 import jsonc
 from app.common.fluent_tooltip import apply_fluent_tooltip
 from app.core.item import TaskItem, ConfigItem
+from app.core.utils.controller_defaults import normalize_adb_controller_options
 from app.common.constants import _RESOURCE_, _CONTROLLER_, POST_ACTION
 from app.common.config import cfg
 from app.core.core import ServiceCoordinator
@@ -501,6 +502,16 @@ class AddConfigDialog(BaseAddDialog):
                 task_option={},
             ),
         ]
+        # 新配置的控制器按所选 bundle 的 interface 补齐 ADB 默认连接地址，
+        # 使多配置下新增的控制器无需手动填写即可正常启动。
+        controller_task = next(
+            (task for task in default_tasks if task.item_id == _CONTROLLER_),
+            None,
+        )
+        if controller_task is not None:
+            normalize_adb_controller_options(
+                controller_task.task_option, bundle_interface
+            )
 
         # bundle 字段现在仅保存 bundle 名称字符串，由 ConfigService 通过主配置解析详情
         self.item = ConfigItem(

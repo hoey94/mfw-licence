@@ -16,6 +16,8 @@ from app.common.fluent_tooltip import apply_fluent_tooltip
 from app.utils.gpu_cache import gpu_cache
 from app.utils.logger import logger
 from app.common.config import cfg
+from app.common.constants import DEFAULT_ADB_ADDRESS
+from app.core.utils.controller_defaults import adb_default_connection_values
 from app.core.core import ServiceCoordinator
 from app.widget.path_line_edit import PathLineEdit
 from app.view.task_interface.components.option_widget_mixin.device_finder_widget import (
@@ -1684,6 +1686,29 @@ class ControllerSettingWidget(QWidget):
                     finally:
                         self._syncing = False
 
+    def _persist_adb_defaults(self, controller_name: str) -> None:
+        """把界面展示的 ADB 默认连接参数写回当前配置（UI 持有的是选项副本）。"""
+        try:
+            interface = self.service_coordinator.interface_api.data
+            defaults = adb_default_connection_values(interface, controller_name)
+            controller_config = self.current_config.get(controller_name)
+            if not isinstance(controller_config, dict):
+                controller_config = {}
+                self.current_config[controller_name] = controller_config
+            for field, value in defaults.items():
+                if str(controller_config.get(field) or "").strip():
+                    continue
+                # 逐字段写入：update_controller_field 会与磁盘上已有的
+                # 设备信息合并，避免覆盖用户已配置的其他控制器子选项。
+                if not self.service_coordinator.options.update_controller_field(
+                    controller_name, "adb", field, value
+                ):
+                    logger.warning("控制器默认 ADB 参数保存失败: %s", field)
+                    continue
+                controller_config[field] = value
+        except Exception as exc:
+            logger.warning("保存控制器默认 ADB 连接地址失败: %s", exc)
+
     def _auto_save_options(self, changed_options: dict[str, Any] | None = None):
         """向 OptionFacade 提交控制器表单值。"""
         if self._syncing:
@@ -1733,9 +1758,13 @@ class ControllerSettingWidget(QWidget):
             return
         # 使用控制器名称作为键，而不是控制器类型
         # 兼容旧配置：如果使用控制器名称找不到，尝试使用控制器类型
-        if controller_name in self.current_config:
+        if controller_type == "adb":
+            # UI 的 current_config 是选项的副本，默认值必须显式写回配置，
+            # 否则任务流从磁盘读取时会认为 ADB 连接地址为空。
+            self._persist_adb_defaults(controller_name)
+        if isinstance(self.current_config.get(controller_name), dict):
             controller_cfg = self.current_config[controller_name]
-        elif controller_type in self.current_config:
+        elif isinstance(self.current_config.get(controller_type), dict):
             # 迁移旧配置：将控制器类型的配置迁移到控制器名称
             controller_cfg = self.current_config[controller_type]
             self.current_config[controller_name] = controller_cfg
