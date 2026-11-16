@@ -33,9 +33,6 @@ from maa.define import (
     MaaMacOSInputMethodEnum,
 )
 
-# ADB 连接地址默认值（新建控制器配置与旧配置空值迁移都会使用）
-DEFAULT_ADB_ADDRESS = "127.0.0.1:16384"
-
 
 def _build_method_options_from_enum(
     enum_cls: Type[Any],
