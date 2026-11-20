@@ -271,12 +271,12 @@ jobs:
           enable-plugins: pyside6
           windows-console-mode: ${{ steps.exe_meta.outputs.win_console_mode }}
           windows-icon-from-ico: ./app/assets/icons/logo.ico
-          company-name: ${{ github.repository_owner }}
-          product-name: MFW-ChainFlow Assistant
+          company-name: 魅月科技
+          product-name: MeiYue Assistant
           file-version: ${{ steps.exe_meta.outputs.win_file_version }}
           product-version: ${{ steps.exe_meta.outputs.win_product_version }}
-          file-description: MaaFramework GUI runner (interface v2)
-          copyright: "Copyright (C) ${{ github.repository_owner }} and contributors. Licensed under AGPL-3.0."
+          file-description: MYFramework GUI runner (interface v2)
+          copyright: "Copyright (C) 2026 MeiYue Technology. All rights reserved."
           user-package-configuration-file: nuitka-package.config.yml
           include-package: |
             maa
@@ -284,10 +284,6 @@ jobs:
             MaaAgentBinary
             app.builtin_tasks
           include-package-data: MaaAgentBinary
-          include-data-files: |
-            README.md=MFW_README.md
-            README-en.md=MFW_README-en.md
-            LICENSE=MFW_LICENSE
       - name: Qt GUI with PySide6 (Linux)
         if: matrix.platform == 'linux'
         uses: Nuitka/Nuitka-Action@main
@@ -300,12 +296,12 @@ jobs:
           enable-plugins: pyside6
           linux-icon: ./app/assets/icons/logo.png
           output-file: MFW
-          company-name: ${{ github.repository_owner }}
-          product-name: MFW-ChainFlow Assistant
+          company-name: 魅月科技
+          product-name: MeiYue Assistant
           file-version: ${{ steps.exe_meta.outputs.win_file_version }}
           product-version: ${{ steps.exe_meta.outputs.win_product_version }}
-          file-description: MaaFramework GUI runner (interface v2)
-          copyright: "Copyright (C) ${{ github.repository_owner }} and contributors. Licensed under AGPL-3.0."
+          file-description: MYFramework GUI runner (interface v2)
+          copyright: "Copyright (C) 2026 MeiYue Technology. All rights reserved."
           user-package-configuration-file: nuitka-package.config.yml
           include-package: |
             maa
@@ -325,28 +321,23 @@ jobs:
           enable-plugins: pyside6
           macos-target-arch: ${{ matrix.target_arch }}
           macos-app-icon: ./app/assets/icons/logo.png
-          macos-signed-app-name: com.hoey94.mfw-licence
+          macos-signed-app-name: com.meiyue.meiyue-assistant
           macos-app-name: MFW-ChainFlow Assistant
           macos-app-mode: gui
           macos-app-console-mode: disable
           macos-app-version: ${{ steps.exe_meta.outputs.win_product_version }}
-          company-name: ${{ github.repository_owner }}
-          product-name: MFW-ChainFlow Assistant
+          company-name: 魅月科技
+          product-name: MeiYue Assistant
           file-version: ${{ steps.exe_meta.outputs.win_file_version }}
           product-version: ${{ steps.exe_meta.outputs.win_product_version }}
-          file-description: MaaFramework GUI runner (interface v2)
-          copyright: "Copyright (C) ${{ github.repository_owner }} and contributors. Licensed under AGPL-3.0."
+          file-description: MYFramework GUI runner (interface v2)
+          copyright: "Copyright (C) 2026 MeiYue Technology. All rights reserved."
           user-package-configuration-file: nuitka-package.config.yml
           include-package: |
             maa
             PIL
             app.builtin_tasks
           include-module: MaaAgentBinary
-          include-data-files: |
-            README.md=MFW_README.md
-            README-en.md=MFW_README-en.md
-            LICENSE=MFW_LICENSE
-            AUTHORS.md=MFW_AUTHORS.md
       # standalone：main.dist 内为 maa/bin；迁入 mfw-release 后执行 move_maa_bin_to_maafw，与 MAAFW_BINARY_PATH=maafw 一致
       - name: Assemble mfw-release (Windows)
         if: matrix.platform == 'win'
@@ -388,10 +379,6 @@ jobs:
           chmod +x "$rel/MFW"
           # onefile 运行时 cwd 为发行根；maa 原生库仍须外置 maafw/（MAAFW_BINARY_PATH）
           python3 tools/packaging/move_maa_bin_to_maafw.py "$src_dist" "$rel"
-          cp README.md "$rel/MFW_README.md"
-          cp README-en.md "$rel/MFW_README-en.md"
-          cp LICENSE "$rel/MFW_LICENSE"
-          cp AUTHORS.md "$rel/MFW_AUTHORS.md"
           mkdir -p "$rel/app/assets/icons"
           cp app/assets/icons/logo.png "$rel/app/assets/icons/logo.png"
           test -x "$rel/MFW"
@@ -408,20 +395,18 @@ jobs:
           tag_xml = _xml.escape(tag_plain)
           win_ver_plain = os.environ.get("MFW_WIN_VER", "0.0.0.0")
           win_ver_xml = _xml.escape(win_ver_plain)
-          owner = _xml.escape(os.environ.get("GITHUB_REPOSITORY_OWNER", ""))
-          repo = os.environ.get("GITHUB_REPOSITORY", "")
-          home = _xml.escape(f"https://github.com/{repo}")
+          owner = "魅月科技"
 
           launcher = """#!/usr/bin/env sh
           HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
           cd "$HERE" || exit 1
           exec ./MFW "$@"
           """
-          (main / "run-mfw.sh").write_text(
+          (main / "run-meiyue.sh").write_text(
               "\n".join(line.lstrip() for line in launcher.strip().splitlines()) + "\n",
               encoding="utf-8",
           )
-          (main / "run-mfw.sh").chmod(0o755)
+          (main / "run-meiyue.sh").chmod(0o755)
 
           desktop = f"""[Desktop Entry]
           Version=1.5
@@ -429,16 +414,16 @@ jobs:
           Terminal=false
           Categories=Utility;Development;
           StartupWMClass=MFW
-          Name=MFW-ChainFlow Assistant
-          Name[zh_CN]=链程助手
-          GenericName=MaaFramework GUI
-          Comment=Visual runner for MaaFramework automation (interface v2). Build tag: {tag_plain}
-          Comment[zh_CN]=基于 MaaFramework 的可视化自动化运行器（interface v2）。构建标识：{tag_plain}
-          Keywords=maa;MaaFramework;automation;PySide6;
+          Name=MeiYue Assistant
+          Name[zh_CN]=魅月助手
+          GenericName=MYFramework GUI
+          Comment=Visual runner for MYFramework automation (interface v2). Build tag: {tag_plain}
+          Comment[zh_CN]=基于 MYFramework 的可视化自动化运行器（interface v2）。构建标识：{tag_plain}
+          Keywords=MYFramework;automation;PySide6;
           Icon=app/assets/icons/logo.png
-          Exec=./run-mfw.sh
+          Exec=./run-meiyue.sh
           """
-          (main / "io.github.hoey94.mfw-licence.desktop").write_text(
+          (main / "com.meiyue.meiyue-assistant.desktop").write_text(
               "\n".join(line.lstrip() for line in desktop.strip().splitlines()) + "\n",
               encoding="utf-8",
           )
@@ -448,17 +433,15 @@ jobs:
           metainfo_dir.mkdir(parents=True, exist_ok=True)
           xml_body = f"""<?xml version="1.0" encoding="UTF-8"?>
           <component type="desktop-application">
-            <id>io.github.hoey94.mfw-licence</id>
+            <id>com.meiyue.meiyue-assistant</id>
             <metadata_license>MIT</metadata_license>
             <project_license>AGPL-3.0-or-later</project_license>
-            <name>MFW-ChainFlow Assistant</name>
-            <name xml:lang="zh_CN">链程助手</name>
-            <summary>Visual runner for MaaFramework automation (interface v2)</summary>
-            <summary xml:lang="zh_CN">基于 MaaFramework 的可视化自动化运行器（interface v2）</summary>
+            <name>MeiYue Assistant</name>
+            <name xml:lang="zh_CN">魅月助手</name>
+            <summary>Visual runner for MYFramework automation (interface v2)</summary>
+            <summary xml:lang="zh_CN">基于 MYFramework 的可视化自动化运行器（interface v2）</summary>
             <developer_name>{owner}</developer_name>
-            <url type="homepage">{home}</url>
-            <url type="bugtracker">{home}/issues</url>
-            <launchable type="desktop-id">io.github.hoey94.mfw-licence.desktop</launchable>
+            <launchable type="desktop-id">com.meiyue.meiyue-assistant.desktop</launchable>
             <releases>
               <release version="{win_ver_xml}" date="{_xml.escape(today)}">
                 <description>
@@ -468,7 +451,7 @@ jobs:
             </releases>
           </component>
           """
-          (metainfo_dir / "io.github.hoey94.mfw-licence.metainfo.xml").write_text(
+          (metainfo_dir / "com.meiyue.meiyue-assistant.metainfo.xml").write_text(
               "\n".join(line.lstrip() for line in xml_body.strip().splitlines()) + "\n",
               encoding="utf-8",
           )
@@ -521,10 +504,6 @@ jobs:
           # install_name_tool 会破坏签名；外置 maafw/ 不在 .app 内，需单独重签。
           python3 tools/packaging/codesign_macos_release.py "$rel"
 
-          cp README.md "$rel/MFW_README.md"
-          cp README-en.md "$rel/MFW_README-en.md"
-          cp LICENSE "$rel/MFW_LICENSE"
-          cp AUTHORS.md "$rel/MFW_AUTHORS.md"
 
           # Nuitka 会先签名原始 bundle；移动 dylib 和重命名入口后必须重新封装签名。
           codesign --force --deep --sign - "$app"
@@ -538,7 +517,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mfw-licence-${{ matrix.platform }}-${{ matrix.arch }}
+          name: meiyue-assistant-${{ matrix.platform }}-${{ matrix.arch }}
           path: ${{ matrix.nuitka_artifact }}
           include-hidden-files: true
 
@@ -571,7 +550,7 @@ jobs:
               b"\xfe\xed\xfa\xcf",
               b"\xfe\xed\xfa\xce",
           }
-          named = {"MFW", "run-mfw.sh", "maapicli", "minicap", "minitouch", "maatouch"}
+          named = {"MFW", "run-meiyue.sh", "maapicli", "minicap", "minitouch", "maatouch"}
           for path in root.rglob("*"):
               if not path.is_file() or path.is_symlink():
                   continue
