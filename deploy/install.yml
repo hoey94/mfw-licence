@@ -60,13 +60,13 @@ jobs:
           out-file-path: "deps"
           extract: true
 
-      - name: Download mfw-licence release
+      - name: Download MeiYue Assistant release
         if: matrix.os != 'android'
         id: download_release
         uses: robinraju/release-downloader@v1
         with:
           repository: hoey94/mfw-licence
-          fileName: "mfw-licence-${{ matrix.os }}-${{ matrix.arch }}*"
+          fileName: "meiyue-assistant-${{ matrix.os }}-${{ matrix.arch }}*"
           latest: true
           out-file-path: "MFW"
           extract: true
@@ -98,7 +98,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mfw-licence-resource-${{ matrix.os }}-${{ matrix.arch }}
+          name: meiyue-assistant-resource-${{ matrix.os }}-${{ matrix.arch }}
           path: "install"
 
   release:
