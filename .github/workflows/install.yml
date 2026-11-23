@@ -117,6 +117,17 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
+      - name: Download resource bundle
+        if: vars.RESOURCE_ENABLED == 'true'
+        uses: robinraju/release-downloader@v1
+        with:
+          repository: ${{ vars.RESOURCE_REPO }}
+          tag: ${{ vars.RESOURCE_TAG }}
+          fileName: mfw-xs-resource-${{ vars.RESOURCE_TAG }}${{ matrix.platform == 'win' && '.zip' || '.tar.gz' }}
+          out-file-path: build/resource-bundle
+          extract: true
+          token: ${{ secrets.RESOURCE_TOKEN }}
+
       - name: vcpkg clone & bootstrap (Windows ARM64)
         if: matrix.platform == 'win' && matrix.arch == 'aarch64'
         shell: pwsh
@@ -353,6 +364,17 @@ jobs:
           Rename-Item -LiteralPath (Join-Path $rel "main.exe") -NewName "MFW.exe" -Force
           python tools/packaging/move_maa_bin_to_maafw.py $rel
 
+      - name: Inject resource bundle (Windows)
+        if: matrix.platform == 'win' && vars.RESOURCE_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          $rel = Join-Path "build" "mfw-release"
+          $bundle = Join-Path "build" "resource-bundle"
+          if (-not (Test-Path -LiteralPath $bundle -PathType Container)) { Write-Error "missing $bundle"; exit 1 }
+          if (-not (Test-Path -LiteralPath (Join-Path $bundle "interface.json") -PathType Leaf)) { Write-Error "missing interface.json in resource bundle"; exit 1 }
+          Copy-Item -Path (Join-Path $bundle '*') -Destination $rel -Recurse -Force
+          Get-ChildItem -LiteralPath $rel -Name | Select-Object -First 20
+
       - name: Assemble mfw-release (Linux)
         if: matrix.platform == 'linux'
         shell: bash
@@ -457,6 +479,18 @@ jobs:
           )
           PY
 
+      - name: Inject resource bundle (Linux)
+        if: matrix.platform == 'linux' && vars.RESOURCE_ENABLED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rel="build/mfw-release"
+          bundle="build/resource-bundle"
+          if [[ ! -d "$bundle" ]]; then echo "missing $bundle"; exit 1; fi
+          if [[ ! -f "$bundle/interface.json" ]]; then echo "missing interface.json in resource bundle"; exit 1; fi
+          cp -a "$bundle/." "$rel/"
+          ls "$rel" | head -20
+
       - name: Assemble mfw-release (macOS)
         if: matrix.platform == 'macos'
         shell: bash
@@ -510,6 +544,18 @@ jobs:
           codesign --verify --deep --strict "$app"
           test -x "$macos_dir/MFW"
           test -f "$rel/maafw/maa/bin/libMaaFramework.dylib"
+
+      - name: Inject resource bundle (macOS)
+        if: matrix.platform == 'macos' && vars.RESOURCE_ENABLED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rel="build/mfw-release"
+          bundle="build/resource-bundle"
+          if [[ ! -d "$bundle" ]]; then echo "missing $bundle"; exit 1; fi
+          if [[ ! -f "$bundle/interface.json" ]]; then echo "missing interface.json in resource bundle"; exit 1; fi
+          cp -a "$bundle/." "$rel/"
+          ls "$rel" | head -20
 
       - name: Generate distribution file list
         run: python tools/packaging/build_nuitka.py --file-list
