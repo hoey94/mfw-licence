@@ -3758,7 +3758,7 @@ interface.name 字段可能与 multi_config.json 中的包键不匹配。请检�
         <message>
             <location filename="../view/schedule_interface/schedule_interface.py" line="155" />
             <source>schedule_interface_info_windows</source>
-            <translation>计划任务将注册到 Windows 任务计划程序（文件夹：MFW-ChainFlow Assistant），无需保持 MFW 常驻。若到点已有实例在运行，默认跳过；勾选「强制启动」时将附带 --force-restart。</translation>
+            <translation>计划任务将注册到 Windows 任务计划程序，无需保持 MFW 常驻。若到点已有实例在运行，默认跳过；勾选「强制启动」时将附带 --force-restart。</translation>
         </message>
         <message>
             <location filename="../view/schedule_interface/schedule_interface.py" line="159" />

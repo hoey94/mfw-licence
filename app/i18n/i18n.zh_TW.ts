@@ -3517,7 +3517,7 @@ interface.name 欄位可能與 multi_config.json 中的套件金鑰不符。請�
         <message>
             <location filename="../view/schedule_interface/schedule_interface.py" line="155" />
             <source>schedule_interface_info_windows</source>
-            <translation>計劃任務將註冊到 Windows 工作排程器（資料夾：MFW-ChainFlow Assistant），無需保持 MFW 常駐。若到點已有執行個體正在執行，預設跳過；勾選「強制開始」時將附帶 --force-restart。</translation>
+            <translation>計劃任務將註冊到 Windows 工作排程器，無需保持 MFW 常駐。若到點已有執行個體正在執行，預設跳過；勾選「強制開始」時將附帶 --force-restart。</translation>
         </message>
         <message>
             <location filename="../view/schedule_interface/schedule_interface.py" line="157" />

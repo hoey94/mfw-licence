@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import re
 import subprocess
 import sys
@@ -48,6 +49,25 @@ def _subprocess_text_encoding() -> str:
 
         return locale.getpreferredencoding(False) or "utf-8"
     return "utf-8"
+
+
+def _decode_subprocess_output(data: bytes) -> str:
+    """按实际字节编码解码子进程输出。
+
+    ``schtasks /Query /XML`` 的 XML 声明固定写着 UTF-16，但经管道输出时实际
+    使用 UTF-8；若按系统区域编码（中文系统为 cp936）解码，Description 里的
+    中文配置名会变成乱码，重启后计划列表的配置列因此显示替代符。
+    """
+    if not data:
+        return ""
+    if data.startswith(codecs.BOM_UTF8):
+        return data.decode("utf-8-sig", errors="replace")
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16", errors="replace")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode(_subprocess_text_encoding(), errors="replace")
 
 
 _WEEKDAY_NAMES = (
@@ -234,15 +254,12 @@ class WindowsTaskSchedulerBackend(SystemSchedulerBackend):
             result = subprocess.run(
                 ["schtasks", "/Create", "/TN", task_name, "/XML", str(temp_path), "/F"],
                 capture_output=True,
-                text=True,
-                encoding=_subprocess_text_encoding(),
-                errors="replace",
                 timeout=60,
                 check=False,
                 **hidden_subprocess_kwargs(),
             )
             if result.returncode != 0:
-                detail = (result.stderr or result.stdout or "").strip()
+                detail = _decode_subprocess_output(result.stderr or result.stdout).strip()
                 logger.warning(
                     "注册 Windows 计划任务失败 [%s]: %s",
                     entry.entry_id,
@@ -317,15 +334,12 @@ class WindowsTaskSchedulerBackend(SystemSchedulerBackend):
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
                 capture_output=True,
-                text=True,
-                encoding=_subprocess_text_encoding(),
-                errors="replace",
                 timeout=30,
                 check=False,
                 **hidden_subprocess_kwargs(),
             )
             if result.returncode == 0:
-                for line in result.stdout.splitlines():
+                for line in _decode_subprocess_output(result.stdout).splitlines():
                     line = line.strip()
                     if not line or "|" not in line:
                         continue
@@ -348,16 +362,13 @@ class WindowsTaskSchedulerBackend(SystemSchedulerBackend):
             result = subprocess.run(
                 ["schtasks", "/Query", "/XML", "/TN", task_name],
                 capture_output=True,
-                text=True,
-                encoding=_subprocess_text_encoding(),
-                errors="replace",
                 timeout=30,
                 check=False,
                 **hidden_subprocess_kwargs(),
             )
             if result.returncode != 0:
                 return None
-            return result.stdout
+            return _decode_subprocess_output(result.stdout)
         except Exception as exc:
             logger.warning("获取任务 XML 失败 [%s]: %s", entry_id, exc)
             return None
@@ -516,9 +527,6 @@ class WindowsTaskSchedulerBackend(SystemSchedulerBackend):
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
                 capture_output=True,
-                text=True,
-                encoding=_subprocess_text_encoding(),
-                errors="replace",
                 timeout=30,
                 check=False,
                 **hidden_subprocess_kwargs(),
@@ -528,12 +536,16 @@ class WindowsTaskSchedulerBackend(SystemSchedulerBackend):
             return set()
 
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()
+            detail = _decode_subprocess_output(result.stderr or result.stdout).strip()
             if detail:
                 logger.warning("列举 Windows 计划任务失败: %s", detail)
             return set()
 
-        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        return {
+            line.strip()
+            for line in _decode_subprocess_output(result.stdout).splitlines()
+            if line.strip()
+        }
 
     def _run_change(self, args: list[str], entry_id: str, action: str) -> bool:
         task_name = task_full_name(entry_id)
@@ -541,15 +553,12 @@ class WindowsTaskSchedulerBackend(SystemSchedulerBackend):
             result = subprocess.run(
                 ["schtasks", *args],
                 capture_output=True,
-                text=True,
-                encoding=_subprocess_text_encoding(),
-                errors="replace",
                 timeout=60,
                 check=False,
                 **hidden_subprocess_kwargs(),
             )
             if result.returncode != 0:
-                detail = (result.stderr or result.stdout or "").strip()
+                detail = _decode_subprocess_output(result.stderr or result.stdout).strip()
                 if "cannot find" in detail.lower() or "找不到" in detail:
                     return True
                 logger.warning(

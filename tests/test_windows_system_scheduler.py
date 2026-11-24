@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.core.service.schedule_service import (
@@ -10,6 +11,8 @@ from app.core.service.schedule_service import (
     ScheduleEntry,
 )
 from app.core.service.system_scheduler.windows import (
+    WindowsTaskSchedulerBackend,
+    _decode_subprocess_output,
     build_task_xml,
     task_folder,
     task_full_name,
@@ -193,6 +196,45 @@ class BuildTaskXmlTests(unittest.TestCase):
             "\\MFW-ChainFlow Assistant-testinst01\\sched_abc",
         )
         self.assertEqual(task_folder(), "MFW-ChainFlow Assistant-testinst01")
+
+
+class DecodeSubprocessOutputTests(unittest.TestCase):
+    def test_utf8_chinese_output_is_not_garbled(self) -> None:
+        raw = "MFW schedule: 默认配置".encode("utf-8")
+        self.assertEqual(_decode_subprocess_output(raw), "MFW schedule: 默认配置")
+
+    def test_locale_encoded_output_still_supported(self) -> None:
+        raw = "MFW schedule: 默认配置".encode("cp936")
+        self.assertEqual(_decode_subprocess_output(raw), "MFW schedule: 默认配置")
+
+    def test_utf8_bom_is_stripped(self) -> None:
+        raw = b"\xef\xbb\xbf" + "任务".encode("utf-8")
+        self.assertEqual(_decode_subprocess_output(raw), "任务")
+
+    def test_utf16_bom_is_decoded(self) -> None:
+        raw = "任务".encode("utf-16")
+        self.assertEqual(_decode_subprocess_output(raw), "任务")
+
+
+class QueryTaskXmlTests(unittest.TestCase):
+    @patch("app.core.service.system_scheduler.windows.subprocess.run")
+    def test_description_name_round_trips_as_utf8(self, mock_run: object) -> None:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-16"?>'
+            '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+            "<RegistrationInfo><Description>MFW schedule: 默认配置</Description></RegistrationInfo>"
+            "</Task>"
+        )
+        mock_run.return_value = SimpleNamespace(
+            returncode=0, stdout=xml.encode("utf-8"), stderr=b""
+        )
+
+        backend = WindowsTaskSchedulerBackend()
+        xml_str = backend._get_task_xml("sched_test123")
+        self.assertIsNotNone(xml_str)
+        entry = backend._parse_task_xml("sched_test123", xml_str)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.name, "默认配置")
 
 
 if __name__ == "__main__":
