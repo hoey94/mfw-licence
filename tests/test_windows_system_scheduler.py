@@ -203,7 +203,11 @@ class DecodeSubprocessOutputTests(unittest.TestCase):
         raw = "MFW schedule: 默认配置".encode("utf-8")
         self.assertEqual(_decode_subprocess_output(raw), "MFW schedule: 默认配置")
 
-    def test_locale_encoded_output_still_supported(self) -> None:
+    @patch(
+        "app.core.service.system_scheduler.windows._subprocess_text_encoding",
+        return_value="cp936",
+    )
+    def test_locale_encoded_output_still_supported(self, _mock_encoding: object) -> None:
         raw = "MFW schedule: 默认配置".encode("cp936")
         self.assertEqual(_decode_subprocess_output(raw), "MFW schedule: 默认配置")
 
