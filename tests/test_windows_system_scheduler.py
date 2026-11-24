@@ -204,10 +204,15 @@ class DecodeSubprocessOutputTests(unittest.TestCase):
         self.assertEqual(_decode_subprocess_output(raw), "MFW schedule: 默认配置")
 
     @patch(
-        "app.core.service.system_scheduler.windows._subprocess_text_encoding",
+        "app.core.service.system_scheduler.windows.sys.platform",
+        "win32",
+    )
+    @patch(
+        "app.core.service.system_scheduler.windows._windows_ansi_encoding",
         return_value="cp936",
     )
-    def test_locale_encoded_output_still_supported(self, _mock_encoding: object) -> None:
+    def test_ansi_encoded_output_in_utf8_mode(self, _mock_ansi: object) -> None:
+        """Nuitka exe 处于 UTF-8 模式时，schtasks 带 CREATE_NO_WINDOW 输出 ANSI 字节。"""
         raw = "MFW schedule: 默认配置".encode("cp936")
         self.assertEqual(_decode_subprocess_output(raw), "MFW schedule: 默认配置")
 

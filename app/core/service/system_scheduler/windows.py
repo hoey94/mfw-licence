@@ -43,20 +43,35 @@ def task_full_name(entry_id: str) -> str:
     return f"\\{task_folder()}\\{entry_id}"
 
 
+def _windows_ansi_encoding() -> str:
+    """返回 Windows 系统 ANSI 代码页对应的 Python 编码名。
+
+    不能用 ``locale.getpreferredencoding(False)``：在 Python UTF-8 模式
+    （Nuitka 打包的 exe 默认开启）下它始终返回 ``utf-8``，无法反映
+    ``schtasks`` 等控制台程序实际使用的系统 ANSI 代码页。
+    """
+    try:
+        import ctypes
+
+        code_page = ctypes.windll.kernel32.GetACP()
+        return f"cp{code_page}"
+    except Exception:
+        return "cp936"
+
+
 def _subprocess_text_encoding() -> str:
     if sys.platform == "win32":
-        import locale
-
-        return locale.getpreferredencoding(False) or "utf-8"
+        return _windows_ansi_encoding()
     return "utf-8"
 
 
 def _decode_subprocess_output(data: bytes) -> str:
     """按实际字节编码解码子进程输出。
 
-    ``schtasks /Query /XML`` 的 XML 声明固定写着 UTF-16，但经管道输出时实际
-    使用 UTF-8；若按系统区域编码（中文系统为 cp936）解码，Description 里的
-    中文配置名会变成乱码，重启后计划列表的配置列因此显示替代符。
+    ``schtasks /Query /XML`` 的输出编码取决于是否带 ``CREATE_NO_WINDOW``
+    标志以及 Python 是否处于 UTF-8 模式：可能输出 UTF-8，也可能输出系统
+    ANSI 代码页（中文系统为 cp936）。这里先尝试 UTF-8，失败后回退到真实
+    的 Windows ANSI 代码页，避免中文配置名变成乱码。
     """
     if not data:
         return ""
@@ -67,7 +82,9 @@ def _decode_subprocess_output(data: bytes) -> str:
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
-        return data.decode(_subprocess_text_encoding(), errors="replace")
+        if sys.platform == "win32":
+            return data.decode(_windows_ansi_encoding(), errors="replace")
+        return data.decode("utf-8", errors="replace")
 
 
 _WEEKDAY_NAMES = (
