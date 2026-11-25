@@ -51,9 +51,9 @@ class ResourceRunConfirmDialog(MessageBoxBase):
             self._info_row(self.tr("Resource"), resource_name or self.tr("(unknown)"))
         )
         self.viewLayout.addLayout(self._contact_row(contact))
-        self.viewLayout.addLayout(
-            self._github_row(github, github_owner, github_repo)
-        )
+        github_row = self._github_row(github, github_owner, github_repo)
+        if github_row is not None:
+            self.viewLayout.addLayout(github_row)
 
         self.yesButton.setText(self.tr("Confirm"))
         self.cancelButton.setText(self.tr("Cancel"))
@@ -94,14 +94,17 @@ class ResourceRunConfirmDialog(MessageBoxBase):
         github: str,
         github_owner: str,
         github_repo: str,
-    ) -> QHBoxLayout:
+    ) -> QHBoxLayout | None:
+        url = (github or "").strip()
+        owner = (github_owner or "").strip()
+        repo = (github_repo or "").strip()
+        if not url and not (owner and repo):
+            return None
+
         row = QHBoxLayout()
         row.setSpacing(12)
         caption = CaptionLabel(self.tr("GitHub"), self)
         caption.setFixedWidth(88)
-        url = (github or "").strip()
-        owner = (github_owner or "").strip()
-        repo = (github_repo or "").strip()
         if owner and repo:
             value = QWidget(self)
             value_layout = QVBoxLayout(value)
@@ -117,13 +120,9 @@ class ResourceRunConfirmDialog(MessageBoxBase):
                 value_layout.addWidget(self._github_url_label(url, value))
             row.addWidget(caption, 0, Qt.AlignmentFlag.AlignTop)
             row.addWidget(value, 1)
-        elif url:
+        else:
             row.addWidget(caption, 0, Qt.AlignmentFlag.AlignTop)
             row.addWidget(self._github_url_label(url, self), 1)
-        else:
-            content = BodyLabel(self.tr("Not provided"), self)
-            row.addWidget(caption, 0, Qt.AlignmentFlag.AlignTop)
-            row.addWidget(content, 1)
         return row
 
     def _github_url_label(self, url: str, parent: QWidget) -> BodyLabel:
